@@ -1,5 +1,5 @@
 use crate::ClientError;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))]
 use keyring_core::{CredentialStore, Entry};
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,6 +15,8 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod fence;
+#[cfg(target_os = "linux")]
+mod linux;
 pub(crate) use fence::{Fence, FenceMode};
 mod admission;
 pub(crate) use admission::OperationPermit;
@@ -44,51 +46,8 @@ struct SessionOwner {
     io_requests: Arc<Semaphore>,
     operation: Arc<Semaphore>,
     lease: Mutex<Weak<admission::Lease>>,
-    // A Linux provider owns a D-Bus connection and encryption session, not
-    // cached credential values. Its lifetime follows this bounded endpoint owner.
-    #[cfg(target_os = "linux")]
-    backend: Mutex<Option<Arc<CredentialStore>>>,
 }
 
-#[cfg(target_os = "linux")]
-impl SessionOwner {
-    fn native_backend(&self) -> keyring_core::Result<Arc<CredentialStore>> {
-        if let Some(store) = self
-            .backend
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return Ok(store);
-        }
-        // The existing I/O permit serializes creation. Never hold this mutex
-        // across OS I/O, including when the waiting caller has timed out.
-        let store = native_store()?;
-        *self.backend.lock().unwrap_or_else(|e| e.into_inner()) = Some(store.clone());
-        Ok(store)
-    }
-
-    fn discard_backend(&self) {
-        self.backend
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct BackendCall<'a>(&'a SessionOwner);
-
-#[cfg(target_os = "linux")]
-impl Drop for BackendCall<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            // Still under the OS I/O permit: an older panic cannot discard a
-            // newer caller's connection after its own permit has been released.
-            self.0.discard_backend();
-        }
-    }
-}
 static OWNERS: OnceLock<Mutex<HashMap<String, Weak<SessionOwner>>>> = OnceLock::new();
 
 impl SessionStore {
@@ -111,8 +70,6 @@ impl SessionStore {
                 io_requests: Arc::new(Semaphore::new(MAX_IO_REQUESTS)),
                 operation: Arc::new(Semaphore::new(1)),
                 lease: Mutex::default(),
-                #[cfg(target_os = "linux")]
-                backend: Mutex::default(),
             });
             owners.insert(key.clone(), Arc::downgrade(&owner));
             owner
@@ -268,22 +225,13 @@ impl SessionStore {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))]
     async fn run<T: Send + 'static>(
         &self,
         event: &'static str,
         action: impl FnOnce(Entry) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
-        #[cfg(target_os = "linux")]
-        let owner = self.owner.clone();
         self.run_io(event, move |service, key| {
-            #[cfg(target_os = "linux")]
-            let _call = BackendCall(&owner);
-            #[cfg(target_os = "linux")]
-            let store = owner
-                .native_backend()
-                .map_err(|_| ClientError::CredentialStore)?;
-            #[cfg(not(target_os = "linux"))]
             let store = native_store().map_err(|_| ClientError::CredentialStore)?;
             #[cfg(target_os = "ios")]
             let modifiers = Some(HashMap::from([(
@@ -292,25 +240,23 @@ impl SessionStore {
             )]));
             #[cfg(not(target_os = "ios"))]
             let modifiers = None;
-            let result = (|| {
-                let entry = store
-                    .build(service, key, modifiers.as_ref())
-                    .map_err(|_| ClientError::CredentialStore)?;
-                action(entry)
-            })();
-            #[cfg(target_os = "linux")]
-            if result.is_err() {
-                // Reconnect on the next admitted call; never retry a write
-                // whose OS outcome may already have happened.
-                owner.discard_backend();
-            }
-            result
+            let entry = store
+                .build(service, key, modifiers.as_ref())
+                .map_err(|_| ClientError::CredentialStore)?;
+            action(entry)
         })
         .await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn read(&self) -> Result<Option<Zeroizing<Vec<u8>>>, ClientError> {
+        #[cfg(target_os = "linux")]
+        return self
+            .run_io("identity.credential.read", |service, key| {
+                linux::with_entry(service, key, linux::Entry::read)
+            })
+            .await;
+        #[cfg(not(target_os = "linux"))]
         self.run("identity.credential.read", |entry| {
             match entry.get_secret() {
                 Ok(secret) => Ok(Some(Zeroizing::new(secret))),
@@ -323,6 +269,13 @@ impl SessionStore {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn write(&self, value: &[u8]) -> Result<(), ClientError> {
         let value = Zeroizing::new(value.to_vec());
+        #[cfg(target_os = "linux")]
+        return self
+            .run_io("identity.credential.write", move |service, key| {
+                linux::with_entry(service, key, |entry| entry.write(&value))
+            })
+            .await;
+        #[cfg(not(target_os = "linux"))]
         self.run("identity.credential.write", move |entry| {
             entry
                 .set_secret(&value)
@@ -332,6 +285,13 @@ impl SessionStore {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn delete(&self) -> Result<(), ClientError> {
+        #[cfg(target_os = "linux")]
+        return self
+            .run_io("identity.credential.delete", |service, key| {
+                linux::with_entry(service, key, linux::Entry::delete)
+            })
+            .await;
+        #[cfg(not(target_os = "linux"))]
         self.run("identity.credential.delete", |entry| {
             match entry.delete_credential() {
                 Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
@@ -342,12 +302,8 @@ impl SessionStore {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))]
 fn native_store() -> keyring_core::Result<Arc<CredentialStore>> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(zbus_secret_service_keyring_store::Store::new()?)
-    }
     #[cfg(target_os = "macos")]
     {
         Ok(apple_native_keyring_store::keychain::Store::new()?)
@@ -372,54 +328,6 @@ mod io_tests;
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore = "requires an actual unlocked native credential service; owns one fresh entry"]
-    async fn reused_connection_reads_external_updates_and_deletion() {
-        let scope = format!("https://nds-native-{}.invalid/", uuid::Uuid::new_v4());
-        let store = SessionStore::for_endpoint(&scope).unwrap();
-        assert!(store.read().await.unwrap().is_none());
-        let first = Zeroizing::new(uuid::Uuid::new_v4().to_string());
-        let second = Zeroizing::new(uuid::Uuid::new_v4().to_string());
-        let service = store.service;
-        let key = store.key.clone();
-        let replacement = second.clone();
-        let outcome = async {
-            store.write(first.as_bytes()).await?;
-            // A separate real provider connection changes the entry without
-            // touching this SessionOwner or any client-side value cache.
-            let other = tokio::task::spawn_blocking(move || {
-                let other = native_store().map_err(|_| ClientError::CredentialStore)?;
-                other
-                    .build(service, &key, None)
-                    .and_then(|entry| entry.set_secret(replacement.as_bytes()))
-                    .map_err(|_| ClientError::CredentialStore)?;
-                Ok::<_, ClientError>((other, key))
-            })
-            .await
-            .map_err(|_| ClientError::CredentialStore)??;
-            let updated = store
-                .read()
-                .await?
-                .is_some_and(|value| value.as_slice() == second.as_bytes());
-            tokio::task::spawn_blocking(move || {
-                other
-                    .0
-                    .build(service, &other.1, None)
-                    .and_then(|entry| entry.delete_credential())
-                    .map_err(|_| ClientError::CredentialStore)
-            })
-            .await
-            .map_err(|_| ClientError::CredentialStore)??;
-            let absent = store.read().await?.is_none();
-            Ok::<_, ClientError>((updated, absent))
-        }
-        .await;
-        let cleaned = store.delete().await;
-        cleaned.unwrap();
-        assert_eq!(outcome.unwrap(), (true, true));
-    }
 
     #[test]
     fn credential_names_preserve_the_existing_sha256_hex_encoding() {

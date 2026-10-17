@@ -14,7 +14,7 @@ generated-check:
     python3 scripts/generate.py --check
 
 wasm-check:
-    cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
+    cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
 
 native-store:
     cargo test --locked --test native_store -- --ignored

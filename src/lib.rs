@@ -1,5 +1,8 @@
 //! NDS identity HTTP client. Secrets stay in Rust and native credential stores.
+pub mod company;
+pub mod company_wire;
 pub mod device_wire;
+pub mod invitation;
 pub mod observability_wire;
 pub mod screen;
 pub mod screen_wire;
@@ -88,6 +91,7 @@ enum Flow {
 
 #[derive(Default)]
 struct State {
+    invitation: Option<invitation::InvitationLink>,
     view: View,
     flow: Option<Flow>,
     session_deadline: Option<Instant>,
@@ -164,6 +168,7 @@ impl IdentityClient {
             clear_flow_state(&mut state);
         }
         let mut view = state.view.clone();
+        view.invitation_pending = state.invitation.is_some();
         if let Some(flow) = &state.flow {
             let (expires, retry) = match flow {
                 Flow::Email {
@@ -320,15 +325,42 @@ impl IdentityClient {
                 return Err(ClientError::Server("rate_limited".into()));
             }
         }
-        let response: wire::EmailChallenge = self
-            .post(
+        let invitation_body = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .invitation
+                .as_ref()
+                .map(|link| link.body(email.clone()))
+                .transpose()?
+        };
+        let response: wire::EmailChallenge = if let Some(body) = invitation_body {
+            let (status, bytes) = self
+                .request_bytes(
+                    WireRequest {
+                        method: Method::POST,
+                        path: "/v2/auth/invitations/challenges",
+                        body: Some(body),
+                        token: None,
+                        locale,
+                        signature: None,
+                    },
+                    &cancel,
+                )
+                .await?;
+            if status != StatusCode::ACCEPTED {
+                return Err(ClientError::InvalidResponse);
+            }
+            decode(&bytes)?
+        } else {
+            self.post(
                 "/v2/auth/email/challenges",
                 &wire::EmailChallengeRequest { email },
                 StatusCode::ACCEPTED,
                 locale,
                 &cancel,
             )
-            .await?;
+            .await?
+        };
         let expires = lifetime(response.expires_in_seconds, 600)?;
         let resend = lifetime(response.resend_after_seconds, 600)?;
         if !valid_id(&response.challenge_id) {
@@ -522,9 +554,11 @@ impl IdentityClient {
     pub async fn start_passkey(
         &self,
         registration: bool,
+        email: Option<String>,
         locale: &str,
     ) -> Result<View, ClientError> {
         self.observe("identity.passkey.start", async {
+            let request = passkey_request(registration, email)?;
             self.require_store_ready()?;
             let (_permit, cancel) = self.operation().await?;
             self.finish_pending_logout(&cancel).await?;
@@ -538,7 +572,7 @@ impl IdentityClient {
                 .request(
                     Method::POST,
                     "/v2/auth/passkeys/start",
-                    Some(&wire::PasskeyRequest { registration }),
+                    Some(&request),
                     token,
                     locale,
                     &cancel,
@@ -971,7 +1005,9 @@ impl IdentityClient {
         };
         let context = nddev_device_sync_telemetry::trace_context(&span);
         // Normalize device paths before recording them; queries and IDs stay out.
-        let route = if let Some(route) = screen::route_template(path) {
+        let route = if let Some(route) =
+            screen::route_template(path).or_else(|| company::route_template(path))
+        {
             route
         } else if path.starts_with("/v2/devices/")
             && !matches!(path, "/v2/devices/challenges" | "/v2/devices/enrollments")
@@ -1019,9 +1055,13 @@ impl IdentityClient {
                 if signed && status==StatusCode::CONFLICT && matches!(serde_json::from_slice::<sync_wire::Sync>(&bytes), Ok(sync_wire::Sync::Conflict(_))) {
                     return Ok((status,bytes));
                 }
-                let response: wire::Error = decode(&bytes)?;
-                let code = serde_json::to_value(response.error)
-                    .map_err(|_| ClientError::InvalidResponse)?;
+                let code = if path.starts_with("/v2/company") {
+                    let response: company_wire::CompanyError = decode(&bytes)?;
+                    serde_json::to_value(response.error)
+                } else {
+                    let response: wire::Error = decode(&bytes)?;
+                    serde_json::to_value(response.error)
+                }.map_err(|_| ClientError::InvalidResponse)?;
                 if token.is_some() && code.as_str() == Some("authentication_failed") {
                     self.require_revalidation();
                     self.invalidate_offline(store::FenceMode::Denied).await?;
@@ -1145,6 +1185,7 @@ mod operation_outcome_tests {
 }
 
 fn clear_flow_state(state: &mut State) {
+    state.invitation = None;
     state.flow = None;
     state.view.flow.clear();
     state.view.authorization_url.clear();
@@ -1479,5 +1520,57 @@ mod native_completion_tests {
             validate_session(&session),
             Err(ClientError::InvalidResponse)
         );
+    }
+}
+
+/// Identity selection is distinct from authentication. Registration has no
+/// selector: its owner comes exclusively from the verified current session.
+fn passkey_request(
+    registration: bool,
+    email: Option<String>,
+) -> Result<wire::PasskeyRequest, ClientError> {
+    if registration && email.is_some() {
+        return Err(ClientError::InvalidInput);
+    }
+    let email = email
+        .map(|value| {
+            nddev_device_sync_domain::identity::EmailAddress::parse(&value)
+                .map(|email| email.as_str().to_owned())
+                .map_err(|_| ClientError::InvalidInput)
+        })
+        .transpose()?;
+    Ok(wire::PasskeyRequest {
+        registration,
+        email,
+    })
+}
+
+#[cfg(test)]
+mod passkey_selector_tests {
+    use super::*;
+    #[test]
+    fn generated_request_carries_canonical_selector_only_for_login() {
+        let value = passkey_request(false, Some(" Member@Example.Invalid ".into())).unwrap();
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({"registration":false,"email":"member@example.invalid"})
+        );
+        assert_eq!(
+            serde_json::to_value(passkey_request(true, None).unwrap()).unwrap(),
+            serde_json::json!({"registration":true})
+        );
+        // The server alone can resolve an omitted selector to one active account.
+        assert_eq!(
+            serde_json::to_value(passkey_request(false, None).unwrap()).unwrap(),
+            serde_json::json!({"registration":false})
+        );
+        for value in [
+            "",
+            "not-email",
+            "person@example.invalid\nother@example.invalid",
+        ] {
+            assert!(passkey_request(false, Some(value.into())).is_err());
+        }
+        assert!(passkey_request(true, Some("other@example.invalid".into())).is_err());
     }
 }

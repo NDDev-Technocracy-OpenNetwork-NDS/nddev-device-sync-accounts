@@ -9,3 +9,9 @@ allow = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = ["https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol.git"]
+
+# Native libsecret build-time target detection; reviewed permissive exception.
+[[licenses.exceptions]]
+name = "target-lexicon"
+version = "=0.13.5"
+allow = ["Apache-2.0 WITH LLVM-exception"]

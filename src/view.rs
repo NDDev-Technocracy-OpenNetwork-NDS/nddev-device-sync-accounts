@@ -37,7 +37,16 @@ impl ClientError {
 
 /// Presentation state, never a bearer credential or a wire request.
 #[derive(Clone, Default)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct View {
+    pub invitation_pending: bool,
     pub devices: Vec<DeviceView>,
     pub current_device_id: String,
     pub devices_checked_at: i64,
@@ -67,6 +76,14 @@ pub struct View {
 /// Public metadata only; signing keys never cross the presentation boundary.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct DeviceView {
     pub device_id: String,
     pub display_name: String,
@@ -92,12 +109,28 @@ impl std::fmt::Debug for View {
 
 /// Bounded public credential metadata; no verifier/public-key bodies or secrets.
 #[derive(Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct PasskeyView {
     pub id: String,
     pub created_at: String,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub enum ExportPolicy {
     #[default]
     Unknown,
@@ -105,6 +138,14 @@ pub enum ExportPolicy {
     Disabled,
 }
 #[derive(Clone, Default)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct DeliveryView {
     pub initialized: bool,
     /// Browser durable-spool availability; native transport does not use it.

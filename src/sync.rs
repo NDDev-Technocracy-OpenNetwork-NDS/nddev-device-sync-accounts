@@ -16,6 +16,7 @@ pub(crate) struct SigningContext {
 
 /// A compiled-in route set, never an arbitrary URL or authenticated HTTP proxy.
 pub enum SyncRequest {
+    Company(crate::company::CompanyRequest),
     Append(Vec<u8>),
     Page {
         after: u64,
@@ -36,6 +37,8 @@ pub enum SyncRequest {
     VaultKey(Vec<u8>),
     Telemetry(Vec<u8>),
     NativeTraces(Vec<u8>),
+    /// Export policy for any active client; no global operator data.
+    TelemetryPolicy,
     ObservabilityStatus,
     Incidents {
         after: String,
@@ -59,6 +62,7 @@ impl SyncRequest {
     }
     fn prepare(self) -> Result<(Method, String, Option<Vec<u8>>), ClientError> {
         match self {
+            Self::Company(request) => request.prepare(),
             SyncRequest::Telemetry(body) => {
                 if body.is_empty() || body.len() > 65_536 {
                     return Err(ClientError::InvalidInput);
@@ -70,6 +74,9 @@ impl SyncRequest {
                     return Err(ClientError::InvalidInput);
                 }
                 Ok((Method::POST, "/v2/observability/traces".into(), Some(body)))
+            }
+            SyncRequest::TelemetryPolicy => {
+                Ok((Method::GET, "/v2/observability/client-policy".into(), None))
             }
             SyncRequest::ObservabilityStatus => {
                 Ok((Method::GET, "/v2/observability/status".into(), None))
@@ -366,6 +373,7 @@ impl IdentityClient {
             &request,
             SyncRequest::Telemetry(_)
                 | SyncRequest::NativeTraces(_)
+                | SyncRequest::TelemetryPolicy
                 | SyncRequest::ObservabilityStatus
                 | SyncRequest::Incidents { .. }
                 | SyncRequest::IncidentAction { .. }
@@ -379,7 +387,7 @@ impl IdentityClient {
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
         let (_permit, cancel) = self.operation().await?;
-        let fence = if request.is_v3() {
+        let fence = if request.is_v3() || matches!(&request, SyncRequest::Company(_)) {
             Some(self.local_use_fence().await?)
         } else {
             self.authorize_local().await?;

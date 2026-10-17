@@ -210,8 +210,8 @@ async fn run(
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
                 changed = active.changed() => { if changed.is_err() { break; } Batch::park(&mut pending); checked = None; continue; },
-                result = identity.sync_request(SyncRequest::ObservabilityStatus) => result,
-            }.and_then(|reply| serde_json::from_slice::<wire::ObservabilityStatus>(&reply.body).map_err(|_| ClientError::InvalidResponse));
+                result = identity.sync_request(SyncRequest::TelemetryPolicy) => result,
+            }.and_then(|reply| serde_json::from_slice::<wire::ClientTelemetryPolicy>(&reply.body).map_err(|_| ClientError::InvalidResponse));
             match result {
                 Ok(status) => {
                     let enabled = matches!(status.export_mode, wire::ExportMode::Enabled);

@@ -1,4 +1,4 @@
 source_repo = "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol"
-source_commit = "5372621aa72f62bf9c3ba6a970c429c3a1e5c1fb"
+source_commit = "e74cc609df8b336d1aaf7a414d640a0c8b3f87e7"
 # Shared identity/control-plane schemas remain v2; sync3 declares its own wire version.
 schema_version = 2

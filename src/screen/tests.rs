@@ -163,3 +163,118 @@ fn original_create_bytes_and_profile_do_not_change_during_retry() {
     wrong.expires_at_ms = 4000;
     assert!(!same_view(&original, &projection(wrong).unwrap()));
 }
+
+#[test]
+fn live_revalidation_never_renews_or_substitutes_an_admitted_view() {
+    let original = projection(row()).unwrap();
+    assert_eq!(
+        current_view(&original, Some(projection(row()).unwrap()), 1500),
+        Ok(true)
+    );
+    assert_eq!(current_view(&original, None, 1500), Ok(false));
+    assert_eq!(
+        current_view(&original, Some(projection(row()).unwrap()), 3000),
+        Ok(false)
+    );
+    for state in [dto::State::Requested, dto::State::Ended] {
+        let mut current = row();
+        current.state = state;
+        assert_eq!(
+            current_view(&original, Some(projection(current).unwrap()), 1500),
+            Ok(false)
+        );
+    }
+    for field in [
+        "view", "viewer", "host", "endpoint", "revision", "expiry", "profile",
+    ] {
+        let mut current = row();
+        match field {
+            "view" => current.view_id = "another-view".into(),
+            "viewer" => current.viewer_device_id = "another-viewer".into(),
+            "host" => current.host_device_id = "another-host".into(),
+            "endpoint" => current.host_endpoint = key(3),
+            "revision" => current.host_revision += 1,
+            "expiry" => current.expires_at_ms += 1000,
+            "profile" => current.output_height = 720,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            current_view(&original, Some(projection(current).unwrap()), 1500),
+            Err(ClientError::InvalidResponse)
+        ));
+    }
+}
+
+#[test]
+fn target_discovery_binds_selection_and_rejects_private_or_unbounded_metadata() {
+    let user = UserId::new("member").unwrap();
+    let row = || dto::ScreenTarget {
+        device_id: "device-1".into(),
+        display_name: "Owned device".into(),
+        platform: dto::Platform::Linux,
+        registered: false,
+    };
+    let page = || dto::ScreenTargetList {
+        user_id: "member".into(),
+        targets: vec![row()],
+    };
+    let values = targets(page(), &user).unwrap();
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].registered);
+    let mut foreign = page();
+    foreign.user_id = "other".into();
+    assert!(matches!(
+        targets(foreign, &user),
+        Err(ClientError::InvalidResponse)
+    ));
+    let mut duplicate = page();
+    duplicate.targets.push(row());
+    assert!(matches!(
+        targets(duplicate, &user),
+        Err(ClientError::InvalidResponse)
+    ));
+    let mut full = page();
+    full.targets = (0..32)
+        .map(|i| {
+            let mut v = row();
+            v.device_id = format!("device-{i}");
+            v
+        })
+        .collect();
+    assert_eq!(targets(full.clone(), &user).unwrap().len(), 32);
+    let mut overflow = row();
+    overflow.device_id = "device-32".into();
+    full.targets.push(overflow);
+    assert!(matches!(
+        targets(full, &user),
+        Err(ClientError::InvalidResponse)
+    ));
+    for name in ["", " leading", "trailing ", "control\nname"] {
+        let mut wrong = page();
+        wrong.targets[0].display_name = name.into();
+        assert!(matches!(
+            targets(wrong, &user),
+            Err(ClientError::InvalidResponse)
+        ));
+    }
+    assert!(decode::<dto::ScreenTargetList>(br#"{"user_id":"member","targets":[{"device_id":"device-1","display_name":"Owned","platform":"linux","registered":true,"public_key":"private"}]}"#).is_err());
+    assert_eq!(
+        route_template("/v2/rds/targets/member"),
+        Some("/v2/rds/targets/{user_id}")
+    );
+    let context = crate::sync::SigningContext {
+        device: DeviceId::new("viewer").unwrap(),
+        nonce: "fresh_nonce_value".into(),
+        created: 1,
+        now_ms: 1000,
+        expires_at_ms: 61000,
+        session_expires_at_ms: 100000,
+    };
+    let (method, path, body, status) = Request::Targets(&user)
+        .prepare("https://example.invalid", &context)
+        .unwrap();
+    assert_eq!(method, http::Method::GET);
+    assert_eq!(path, "/v2/rds/targets/member");
+    assert!(body.is_none());
+    assert_eq!(status, 200);
+}

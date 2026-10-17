@@ -25,6 +25,8 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
@@ -42,7 +44,7 @@ jobs:
         with:
           node-version: '24.22.0'
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
-      - run: cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
       - id: protocol
         run: |
           python - <<'PY'
@@ -63,6 +65,7 @@ jobs:
         env:
           NDS_PROTOCOL_SOURCE: ${{ github.workspace }}/vendor/protocol
       - run: cargo install --locked --version 0.9.148 cargo-nextest
+      - run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
       - run: cargo nextest run --locked --all-features
       - run: cargo install --locked --version 0.22.2 cargo-audit
       - run: cargo install --locked --version 0.20.2 cargo-deny
