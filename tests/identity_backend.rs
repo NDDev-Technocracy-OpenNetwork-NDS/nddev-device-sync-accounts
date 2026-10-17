@@ -18,13 +18,27 @@ async fn actual_mailbox_session_persistence_and_revocation() {
     let view = client.refresh().await.unwrap();
     assert!(view.email_available);
     assert!(!view.authenticated);
-    let challenge = client.request_email(owner.to_owned(), "ru").await.unwrap();
-    assert_eq!(challenge.flow, "email");
     let http = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    let prior: Value = http
+        .get(format!("{mailbox}/api/v1/messages"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let prior_ids: Vec<String> = prior["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["ID"].as_str().map(str::to_owned))
+        .collect();
+    let challenge = client.request_email(owner.to_owned(), "ru").await.unwrap();
+    assert_eq!(challenge.flow, "email");
     let code = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let messages: Value = http
@@ -37,7 +51,13 @@ async fn actual_mailbox_session_persistence_and_revocation() {
                 .unwrap();
             if let Some(id) = messages["messages"]
                 .as_array()
-                .and_then(|items| items.first())
+                .and_then(|items| {
+                    items.iter().find(|message| {
+                        message["ID"]
+                            .as_str()
+                            .is_some_and(|id| !prior_ids.iter().any(|old| old == id))
+                    })
+                })
                 .and_then(|message| message["ID"].as_str())
             {
                 let message: Value = http
@@ -67,6 +87,37 @@ async fn actual_mailbox_session_persistence_and_revocation() {
     let view = client.verify_email(code).await.unwrap();
     assert!(view.authenticated);
     assert_eq!(view.auth_method, "email_otp");
+    if data["client_policy"].as_bool() == Some(true) {
+        use nddev_device_sync_accounts::SyncRequest;
+        let enrolled = client
+            .enroll_device("Owned policy acceptance".into())
+            .await
+            .unwrap();
+        assert!(!enrolled.current_device_id.is_empty());
+        let policy = client
+            .sync_request(SyncRequest::TelemetryPolicy)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&policy.body).unwrap(),
+            serde_json::json!({"export_mode":"enabled"})
+        );
+        if data["operator"].as_bool() == Some(false) {
+            let error = client
+                .sync_request(SyncRequest::ObservabilityStatus)
+                .await
+                .err()
+                .expect("operator request must be denied");
+            assert_eq!(error.code(), "authorization_denied");
+            assert!(client.view().authenticated);
+            assert!(
+                client
+                    .sync_request(SyncRequest::TelemetryPolicy)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
     let another = IdentityClient::new(endpoint).unwrap();
     let restored = another.refresh().await.unwrap();
     assert!(restored.authenticated);

@@ -1,10 +1,12 @@
-//! Rust-only protected endpoint keys and the seven canonical screen control calls.
+//! Rust-only protected endpoint keys and canonical screen control calls.
 //! Native RDS owns endpoint/media I/O and grant verification; metadata is not consent.
 use crate::{ClientError, IdentityClient, LocalUseFence, State, screen_wire as dto};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use nddev_device_sync_application::screen::ScreenTarget;
 use nddev_device_sync_domain::{
-    DeviceId,
+    DeviceId, UserId,
+    devices::{DeviceName, DevicePlatform, MAX_ACTIVE_DEVICES},
     screen::{
         EndpointBinding, MAX_NATIVE_GRANT_BYTES, MAX_VIEW_ID_BYTES, MAX_VIEW_MS, ViewLease,
         ViewPermit, ViewProjection, ViewState, endpoint_signing_bytes,
@@ -160,6 +162,7 @@ pub struct ScreenDelivery {
 }
 
 pub(crate) enum Request<'a> {
+    Targets(&'a UserId),
     Binding(&'a DeviceId),
     Bind(&'a RdsEndpointKey, u64),
     Create(&'a ScreenCreate),
@@ -178,6 +181,17 @@ impl Request<'_> {
     ) -> Result<PreparedRequest, ClientError> {
         use http::Method;
         Ok(match self {
+            Self::Targets(user) => {
+                if matches!(user.as_str(), "." | "..") {
+                    return Err(ClientError::InvalidInput);
+                }
+                (
+                    Method::GET,
+                    format!("/v2/rds/targets/{}", user.as_str()),
+                    None,
+                    200,
+                )
+            }
             Self::Binding(target) => {
                 if matches!(target.as_str(), "." | "..") {
                     return Err(ClientError::InvalidInput);
@@ -238,6 +252,17 @@ impl Request<'_> {
 }
 
 impl IdentityClient {
+    /// Transient discovery only; every view still needs fresh binding authority
+    /// and explicit host consent. No personal inventory key reaches this projection.
+    pub async fn screen_targets(
+        &self,
+        fence: &LocalUseFence,
+        user: &UserId,
+    ) -> Result<Vec<ScreenTarget>, ClientError> {
+        let reply = self.screen_request(fence, Request::Targets(user)).await?;
+        targets(decode(&reply)?, user)
+    }
+
     /// Persist/reconcile a distinct purpose seed before binding a native endpoint.
     pub async fn rds_endpoint_key(&self) -> Result<RdsEndpointKey, ClientError> {
         let (_permit, cancel) = self.operation().await?;
@@ -453,6 +478,41 @@ impl IdentityClient {
         }
         Ok(())
     }
+    /// Fresh participant authorization for an already admitted media stream.
+    /// This never renews its lease or treats cached metadata as server authority.
+    pub async fn screen_revalidate(
+        &self,
+        fence: &LocalUseFence,
+        original: &ViewProjection,
+    ) -> Result<bool, ClientError> {
+        let device = self.view().current_device_id;
+        let current = if original.permit().viewer.as_str() == device {
+            Some(self.screen_view(fence, original.id()).await?.view)
+        } else if original.permit().host.as_str() == device {
+            self.screen_incoming(fence).await?
+        } else {
+            return Err(ClientError::RevalidationRequired);
+        };
+        let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+            .try_into()
+            .map_err(|_| ClientError::RevalidationRequired)?;
+        self.validate_local_use(fence).await?;
+        current_view(original, current, now)
+    }
+}
+
+fn current_view(
+    original: &ViewProjection,
+    current: Option<ViewProjection>,
+    now: u64,
+) -> Result<bool, ClientError> {
+    let Some(mut current) = current else {
+        return Ok(false);
+    };
+    if !same_view(original, &current) {
+        return Err(ClientError::InvalidResponse);
+    }
+    Ok(current.state(now) == ViewState::Ready)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
@@ -492,6 +552,35 @@ fn public_key(value: &str) -> Result<[u8; 32], ClientError> {
     }
     Ok(bytes)
 }
+fn targets(row: dto::ScreenTargetList, user: &UserId) -> Result<Vec<ScreenTarget>, ClientError> {
+    if row.user_id != user.as_str() || row.targets.len() > MAX_ACTIVE_DEVICES {
+        return Err(ClientError::InvalidResponse);
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    row.targets
+        .into_iter()
+        .map(|row| {
+            if !ids.insert(row.device_id.clone()) {
+                return Err(ClientError::InvalidResponse);
+            }
+            Ok(ScreenTarget {
+                device: DeviceId::new(row.device_id).map_err(|_| ClientError::InvalidResponse)?,
+                name: DeviceName::new(row.display_name)
+                    .map_err(|_| ClientError::InvalidResponse)?,
+                platform: match row.platform {
+                    dto::Platform::Android => DevicePlatform::Android,
+                    dto::Platform::Ios => DevicePlatform::Ios,
+                    dto::Platform::Linux => DevicePlatform::Linux,
+                    dto::Platform::Macos => DevicePlatform::Macos,
+                    dto::Platform::Web => DevicePlatform::Web,
+                    dto::Platform::Windows => DevicePlatform::Windows,
+                },
+                registered: row.registered,
+            })
+        })
+        .collect()
+}
+
 fn binding(row: dto::ScreenBinding) -> Result<EndpointBinding, ClientError> {
     let instance =
         uuid::Uuid::parse_str(&row.instance_id).map_err(|_| ClientError::InvalidResponse)?;
@@ -551,7 +640,9 @@ fn same_view(a: &ViewProjection, b: &ViewProjection) -> bool {
         && x.lease.expires_at_ms() == y.lease.expires_at_ms()
 }
 pub(crate) fn route_template(path: &str) -> Option<&'static str> {
-    if path.starts_with("/v2/rds/bindings/") {
+    if path.starts_with("/v2/rds/targets/") {
+        Some("/v2/rds/targets/{user_id}")
+    } else if path.starts_with("/v2/rds/bindings/") {
         Some("/v2/rds/bindings/{device_id}")
     } else if path.starts_with("/v2/rds/views/") && path != "/v2/rds/views/incoming" {
         Some(if path.ends_with("/ready") {

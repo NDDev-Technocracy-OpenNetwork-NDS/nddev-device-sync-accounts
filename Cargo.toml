@@ -7,6 +7,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts"
 
 [features]
+browser-bindings = ["dep:tsify"]
 default = []
 development-http = []
 
@@ -16,7 +17,8 @@ nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-Technocrac
 base64 = "0.23.1"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "cdd04c938fa836921337461f3322c26426f3fbb0" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "0135c86b2887c7cea96c0f1082d70560bde00cc6" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "0135c86b2887c7cea96c0f1082d70560bde00cc6" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.1"
@@ -26,7 +28,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1.53", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "40f1f799a395f67e7a565e9c0c9f4b5ba7fdbe67", features = ["client-traces"] }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "1327eb1fc1a31bd767582d1fa204d2ae204b89df", features = ["client-traces"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
@@ -34,7 +36,9 @@ zeroize = "1.8"
 uuid = { version = "1.27", features = ["v4", "v7"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+libsecret = { version = "=0.9.0", features = ["v0_21"] }
+glib = "0.22"
+gio = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
@@ -57,6 +61,7 @@ prost = "0.14"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
 ring = {version="0.17", features=["wasm32_unknown_unknown_js"]}
 time = {version="0.3", features=["wasm-bindgen"]}
 wasm-bindgen = "=0.2.129"
@@ -66,6 +71,7 @@ uuid = { version = "1.27", features = ["js"] }
 web-time = "1.1"
 futures = "0.3"
 gloo-timers = { version = "0.4", features = ["futures"] }
+web-sys = { version = "=0.3.106", features = ["Window", "Location", "History"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }

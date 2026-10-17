@@ -82,10 +82,28 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     let owner = (initial.user_id, initial.tenant_id);
     let native = SessionStore::for_endpoint(&format!("{endpoint}/")).unwrap();
     let otp_session = native.read().await.unwrap().unwrap();
+    if receipt["multiple_active_accounts"].as_bool() == Some(true) {
+        assert_eq!(
+            client
+                .start_passkey(false, None, "en")
+                .await
+                .unwrap_err()
+                .code(),
+            "authentication_failed"
+        );
+        assert!(client.view().authenticated);
+    }
     let mut first_key = String::new();
     let mut first_session = None;
     for (phase, registration) in [true, false, true, false].into_iter().enumerate() {
-        let view = client.start_passkey(registration, "en").await.unwrap();
+        let view = client
+            .start_passkey(
+                registration,
+                (!registration).then(|| receipt["owner_email"].as_str().unwrap().into()),
+                "en",
+            )
+            .await
+            .unwrap();
         let mut file = std::fs::OpenOptions::new();
         file.write(true).create_new(true);
         #[cfg(unix)]
@@ -115,6 +133,18 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
         std::fs::remove_file(&handoff).unwrap();
         if phase == 0 {
             first_key = client.passkeys().await.unwrap()[0].id.clone();
+            if let Some(other) = receipt["other_email"].as_str() {
+                assert_eq!(
+                    client
+                        .start_passkey(false, Some(other.into()), "en")
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    "authentication_failed"
+                );
+                assert_eq!(client.view().user_id, owner.0);
+                assert!(client.view().authenticated);
+            }
         }
         if phase == 1 {
             first_session = Some(native.read().await.unwrap().unwrap());
@@ -182,7 +212,16 @@ async fn browser_passkey_registration_login_restore_and_revocation() {
     let refreshed = restored.refresh().await.unwrap();
     assert!(!refreshed.authenticated && !refreshed.passkey_available);
     assert!(native.read().await.unwrap().is_none());
-    assert!(restored.start_passkey(false, "en").await.is_err());
+    assert!(
+        restored
+            .start_passkey(
+                false,
+                Some(receipt["owner_email"].as_str().unwrap().into()),
+                "en"
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(
         http.get(format!("{endpoint}/v2/session"))
             .bearer_auth(std::str::from_utf8(&token).unwrap())

@@ -29,9 +29,12 @@ held until the OS call actually returns, including after a caller timeout.
 Native read/write/delete outcomes use the same SDK and retain trace context across
 the blocking OS worker. A caller wait failure and a later OS completion are distinct;
 keys, endpoints, secret values and raw provider errors never enter those events.
-On Linux, that endpoint owner also retains its provider connection; every read
-still queries the actual credential service. Provider failure discards the connection
-before releasing I/O admission, without replaying an uncertain write.
+Linux uses the native libsecret proxy cache; every read reloads the actual secret.
+Provider failure discards that cached proxy without replaying an uncertain write.
+The adapter requires an encrypted Secret Service session and rejects ambiguous
+or locked records; existing service/username attributes and binary values remain
+compatible. Linux builds require libsecret-1 development headers (Debian/Ubuntu:
+`libsecret-1-dev`); runtime requires libsecret 0.21 or newer and a Secret Service.
 
 Linux uses Secret Service, Android uses Android Keystore-encrypted preferences
 with an application-context JNI initializer, Apple uses Keychain and Windows
@@ -62,11 +65,16 @@ keyring, offline restart and later pipeline acceptance remain separate gates.
 
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
 agent consumers. The SDK owns redaction and record lifetimes; the sender checks
-operator export policy, pauses in the background and uses bounded backoff with
+the narrow `/v2/observability/client-policy` export policy, pauses in the background and uses bounded backoff with
 at most eight failed sends per batch and 30-minute retention. Delivery's own
 credential reads and requests remain local diagnostics, outside the export feeds.
 Sign-out/termination closes the feeds; transport acknowledgements are reported
 separately for logs and actual spans and do not imply searchable delivery.
+
+The sender does not require global operator status or incident privileges.
+Company administrators and ordinary users retain telemetry delivery; denial of
+an operator request does not invalidate their personal session. The server must
+provide the narrow policy route before deploying this client revision.
 
 Enabled trace receipts accept zero through the submitted span count, with no
 duplicates. The SDK counts accepted spans as delivered and the remainder as
@@ -126,3 +134,18 @@ outside Flutter, telemetry, URLs and synchronization. The server remains the
 canonical authority for participant roles, binding revisions and finite
 retention; metadata and Ready do not authorize capture. Lost acknowledgements
 or termination before local reconciliation retain delivery uncertainty.
+
+Company transport uses the closed `CompanyRequest` route set and generated
+Protocol company DTOs. Signed company requests revalidate the original local
+identity lifetime before publishing responses. Administrative denials do not
+clear a valid session. `import_invitation` accepts only an exact-instance root
+URL with a canonical fragment; it retains one link in Rust memory, refuses an
+active account/flow, and selects the existing email OTP workflow. Success or
+cancellation clears the link. No token is exposed in `View`. Browser composition
+captures and clears the fragment before presentation routing.
+
+Passkey login accepts the Core-validated email selector from presentation and
+sends it in the generated request body. It never selects the first/bootstrap
+member locally. An omitted selector is resolved only by the server's existing
+unambiguous-account rule. Registration rejects a selector and remains bound to
+the current authenticated session; selectors are never credential proof or logs.
