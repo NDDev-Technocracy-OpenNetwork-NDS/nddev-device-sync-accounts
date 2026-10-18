@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-check:
+check: browser-check
     cargo fmt --check
     cargo nextest run --locked --all-features --jobs 4
     cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
@@ -12,6 +12,11 @@ generate:
 
 generated-check:
     python3 scripts/generate.py --check
+
+browser-check:
+    bun install --frozen-lockfile --ignore-scripts
+    bun run check
+    bun run check:generated
 
 wasm-check:
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
