@@ -98,6 +98,7 @@ struct State {
     // Observations, never independent authority. Only a new protected server
     // receipt can extend an accepted deadline; a clock checkpoint cannot.
     cached_authority: Option<(String, u64)>,
+    cached_deadline: Option<Instant>,
     authority_online: bool,
     next_authority_maintenance: Option<Instant>,
     next_authority_verification: Option<Instant>,
@@ -865,13 +866,9 @@ impl IdentityClient {
         let preserve_devices = preserve_devices
             && s.view.user_id == session.user_id
             && s.view.tenant_id == session.tenant_id;
-        // Account metadata is not a new active-device receipt.
-        s.session_deadline = Some(if preserve_devices && s.cached_authority.is_some() {
-            s.session_deadline
-                .map_or(deadline, |previous| previous.min(deadline))
-        } else {
-            deadline
-        });
+        // Account authentication and local active-device authority have
+        // independent deadlines. Metadata never changes cached_deadline.
+        s.session_deadline = Some(deadline);
         s.view.authenticated = true;
         s.view.session_verified = true;
         s.view.offline_authorized = false;
@@ -883,6 +880,7 @@ impl IdentityClient {
             // same owner. Late work from the preceding session cannot publish.
             s.local_use_generation = Arc::default();
             s.cached_authority = None;
+            s.cached_deadline = None;
             s.authority_online = false;
             s.next_authority_maintenance = None;
             s.next_authority_verification = None;
@@ -909,6 +907,7 @@ impl IdentityClient {
         screen::close_key(&mut s);
         s.session_deadline = None;
         s.cached_authority = None;
+        s.cached_deadline = None;
         s.authority_online = false;
         s.next_authority_maintenance = None;
         s.next_authority_verification = None;
@@ -1313,7 +1312,11 @@ fn expire_session(state: &mut State, now: Instant, wall_time: OffsetDateTime) {
             .session_deadline
             .is_some_and(|deadline| deadline <= now)
             || OffsetDateTime::parse(&state.view.expires_at, &Rfc3339)
-                .is_ok_and(|expires| expires <= wall_time))
+                .is_ok_and(|expires| expires <= wall_time)
+            || (state.view.offline_authorized
+                && state
+                    .cached_deadline
+                    .is_some_and(|deadline| deadline <= now)))
     {
         screen::close_key(state);
         state.view.authenticated = false;
@@ -1322,7 +1325,10 @@ fn expire_session(state: &mut State, now: Instant, wall_time: OffsetDateTime) {
         state.view.offline_cache_ready = false;
         // Latch an observed expiry even when suspension advanced only the wall
         // clock. Rolling it back cannot revive the same cached authorization.
-        state.session_deadline = Some(state.session_deadline.map_or(now, |old| old.min(now)));
+        if state.cached_authority.is_some() {
+            state.cached_deadline = Some(state.cached_deadline.map_or(now, |old| old.min(now)));
+        }
+        state.session_deadline = None;
         state.authority_online = false;
         state.next_authority_maintenance = None;
     }

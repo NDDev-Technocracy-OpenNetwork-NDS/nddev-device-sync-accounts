@@ -126,18 +126,25 @@ impl crate::State {
             .as_ref()
             .is_some_and(|(generation, verified)| generation == &anchor.0 && anchor.1 <= *verified)
         {
-            self.session_deadline = Some(
-                self.session_deadline
+            self.cached_deadline = Some(
+                self.cached_deadline
                     .map_or(candidate, |old| old.min(candidate)),
             );
         } else {
             self.cached_authority = Some(anchor);
-            self.session_deadline = Some(candidate);
+            self.cached_deadline = Some(candidate);
         }
     }
 }
 
 impl IdentityClient {
+    fn local_deadline_valid(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cached_deadline
+            .is_some_and(|deadline| deadline > crate::Instant::now())
+    }
     pub(crate) fn authority_online(&self) -> bool {
         self.state
             .lock()
@@ -203,7 +210,24 @@ impl IdentityClient {
         let Some(cached) = self.read_cached_slot(fence.slot).await? else {
             return Ok(None);
         };
-        cached.validate(&self.origin(), &fence, credential)?;
+        let now = now_ms()?;
+        if let Err(error) = cached.validate_at(&self.origin(), &fence, credential, now) {
+            if now >= cached.authorization.expires_at_ms {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state
+                    .cached_authority
+                    .as_ref()
+                    .is_some_and(|(generation, _)| generation == &fence.generation)
+                {
+                    let now = crate::Instant::now();
+                    state.cached_deadline =
+                        Some(state.cached_deadline.map_or(now, |old| old.min(now)));
+                    state.authority_online = false;
+                    state.next_authority_maintenance = None;
+                }
+            }
+            return Err(error);
+        }
         // A sign-out/revocation or slot publication may race a protected-store
         // read. Do not publish a decision from a superseded metadata generation.
         if self.store.authorization_fence(None).await?.as_ref() != Some(&fence) {
@@ -256,6 +280,7 @@ impl IdentityClient {
             crate::screen::close_key(&mut state);
         }
         state.restore_cached_deadline(anchor, deadline);
+        state.session_deadline = Some(deadline);
         state.authority_online = false;
         state.view.authenticated = true;
         state.view.session_verified = false;
@@ -411,6 +436,10 @@ impl IdentityClient {
             self.require_revalidation();
             return Err(ClientError::RevalidationRequired);
         }
+        if !self.local_deadline_valid() {
+            self.require_online_verification();
+            return Err(ClientError::RevalidationRequired);
+        }
         let view = self.view();
         if !view.authenticated
             || view.credential_revalidation_required
@@ -514,22 +543,22 @@ mod local_use_tests {
                 ("authority".into(), verified),
                 now + Duration::from_secs(3600),
             );
-            assert_eq!(state.session_deadline, Some(accepted));
+            assert_eq!(state.cached_deadline, Some(accepted));
             assert_eq!(state.cached_authority.as_ref().unwrap().1, 2000);
         }
         let renewed = now + Duration::from_secs(120);
         state.restore_cached_deadline(("authority".into(), 2001), renewed);
-        assert_eq!(state.session_deadline, Some(renewed));
+        assert_eq!(state.cached_deadline, Some(renewed));
         state.restore_cached_deadline(("authority".into(), 2000), now + Duration::from_secs(3600));
-        assert_eq!(state.session_deadline, Some(renewed));
+        assert_eq!(state.cached_deadline, Some(renewed));
         let wall = OffsetDateTime::now_utc();
         state.view.authenticated = true;
         state.view.expires_at = wall.format(&Rfc3339).unwrap();
         crate::expire_session(&mut state, now, wall);
         assert!(!state.view.authenticated);
-        assert_eq!(state.session_deadline, Some(now));
+        assert_eq!(state.cached_deadline, Some(now));
         state.restore_cached_deadline(("authority".into(), 2001), renewed);
-        assert_eq!(state.session_deadline, Some(now));
+        assert_eq!(state.cached_deadline, Some(now));
     }
 
     #[test]
@@ -544,11 +573,16 @@ mod local_use_tests {
         let now = crate::Instant::now();
         let original = now + std::time::Duration::from_secs(60);
         client.set_session(session.clone(), original, false);
+        assert!(!client.local_deadline_valid());
         client.state.lock().unwrap().cached_authority = Some(("accepted".into(), 2000));
+        client.state.lock().unwrap().cached_deadline = Some(original);
         client.set_session(session, now + std::time::Duration::from_secs(3600), true);
-        assert_eq!(
-            client.state.lock().unwrap().session_deadline,
-            Some(original)
+        assert_eq!(client.state.lock().unwrap().cached_deadline, Some(original));
+        client.state.lock().unwrap().cached_deadline = Some(now);
+        assert!(!client.local_deadline_valid());
+        assert!(
+            client.device_store().is_ok(),
+            "active account can still obtain device proof"
         );
     }
 
@@ -908,13 +942,13 @@ mod acceptance {
                     .await,
                 Err(ClientError::OnlineVerificationRequired)
             ));
-            let deadline = recreated.state.lock().unwrap().session_deadline.unwrap();
+            let deadline = recreated.state.lock().unwrap().cached_deadline.unwrap();
             recreated
                 .restore_offline(&CancellationToken::new())
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(recreated.state.lock().unwrap().session_deadline.unwrap() <= deadline);
+            assert!(recreated.state.lock().unwrap().cached_deadline.unwrap() <= deadline);
             recreated.maintain_authorization().await.unwrap();
             let offline_cache = recreated
                 .cached_with_fence(&recreated.session_credential().await.unwrap())

@@ -239,7 +239,7 @@ impl IdentityClient {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Self::set_session_state(&mut state, receipt.session, deadline, true);
         // Only this accepted, protected device receipt may extend the deadline.
-        state.session_deadline = Some(deadline);
+        state.cached_deadline = Some(deadline);
         if state
             .cached_authority
             .as_ref()
@@ -286,6 +286,9 @@ impl IdentityClient {
         &self,
         cancel: &CancellationToken,
     ) -> Result<(), ClientError> {
+        if !self.local_deadline_valid() {
+            return Err(ClientError::RevalidationRequired);
+        }
         let credential = self.session_credential().await?;
         let Some((mut cached, old)) = self.cached_with_fence(&credential).await? else {
             return Err(ClientError::RevalidationRequired);
