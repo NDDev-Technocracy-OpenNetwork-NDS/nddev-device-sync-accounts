@@ -49,6 +49,12 @@ authenticated encryption under a non-extractable Web Crypto key in IndexedDB;
 raw bearer tokens cannot be persisted there. This is browser-profile protection,
 not an OS keychain or protection from compromised same-origin script.
 
+Browser I/O is authored in `src/browser_credentials.ts` and `src/browser_http.ts`.
+The pinned TypeScript compiler emits the existing Rust-imported JS paths;
+`just browser-check` verifies strict types, Biome and reproducible output using
+the frozen Bun lockfile. Only string-valued allowlisted request headers cross
+this boundary; malformed values are rejected rather than coerced.
+
 After real session and active-device verification, the client can restore a
 scoped offline authorization until the original session expiry. Two protected
 grant slots and an atomic generation pointer preserve the previous grant across
