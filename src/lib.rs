@@ -1104,7 +1104,10 @@ impl IdentityClient {
             _ = cancel.cancelled() => Err(ClientError::Cancelled),
             result = runtime::timeout(REQUEST_TIMEOUT, operation) => result.unwrap_or(Err(ClientError::Timeout)),
         };
-        if result.as_ref().is_err_and(online_unavailable) {
+        // A module dependency (for example the telemetry collector) can fail
+        // while NDS identity is reachable. Only loss of this connection closes
+        // online admission; explicit refresh/renewal owns its wider fallback.
+        if matches!(&result, Err(ClientError::Transport | ClientError::Timeout)) {
             self.require_online_verification();
         }
         match &result {
