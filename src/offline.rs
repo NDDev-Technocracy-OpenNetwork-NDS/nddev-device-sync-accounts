@@ -147,16 +147,7 @@ impl IdentityClient {
             .map_err(|_| ClientError::CredentialStore)
     }
 
-    async fn cached(&self, credential: &SessionCredential) -> Result<Option<Cached>, ClientError> {
-        Ok(self
-            .cached_with_fence(credential)
-            .await?
-            .map(|(cached, _)| cached))
-    }
-    async fn cached_with_fence(
-        &self,
-        credential: &SessionCredential,
-    ) -> Result<Option<(Cached, Fence)>, ClientError> {
+    async fn ready_fence(&self) -> Result<Option<Fence>, ClientError> {
         let Some(fence) = self.store.authorization_fence(None).await? else {
             return Ok(None);
         };
@@ -173,6 +164,24 @@ impl IdentityClient {
             }
             return Ok(None);
         }
+        Ok(Some(fence))
+    }
+
+    async fn cached_with_fence(
+        &self,
+        credential: &SessionCredential,
+    ) -> Result<Option<(Cached, Fence)>, ClientError> {
+        let Some(fence) = self.ready_fence().await? else {
+            return Ok(None);
+        };
+        self.cached_at_fence(credential, fence).await
+    }
+
+    async fn cached_at_fence(
+        &self,
+        credential: &SessionCredential,
+        fence: Fence,
+    ) -> Result<Option<(Cached, Fence)>, ClientError> {
         let Some(cached) = self.read_cached_slot(fence.slot).await? else {
             return Ok(None);
         };
@@ -189,10 +198,15 @@ impl IdentityClient {
         &self,
         cancel: &CancellationToken,
     ) -> Result<Option<View>, ClientError> {
+        // A fresh/signed-out installation has no offline capability. Do not
+        // read its native secret backend or mask the original server failure.
+        let Some(fence) = self.ready_fence().await? else {
+            return Ok(None);
+        };
         let Some(credential) = self.stored_session_credential().await? else {
             return Ok(None);
         };
-        let Some(cached) = self.cached(&credential).await? else {
+        let Some((cached, _)) = self.cached_at_fence(&credential, fence).await? else {
             return Ok(None);
         };
         if cancel.is_cancelled() {
