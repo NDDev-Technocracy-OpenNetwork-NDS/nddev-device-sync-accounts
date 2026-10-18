@@ -119,6 +119,24 @@ impl Cached {
     }
 }
 
+impl crate::State {
+    fn restore_cached_deadline(&mut self, anchor: (String, u64), candidate: crate::Instant) {
+        if self
+            .cached_authority
+            .as_ref()
+            .is_some_and(|(generation, verified)| generation == &anchor.0 && anchor.1 <= *verified)
+        {
+            self.session_deadline = Some(
+                self.session_deadline
+                    .map_or(candidate, |old| old.min(candidate)),
+            );
+        } else {
+            self.cached_authority = Some(anchor);
+            self.session_deadline = Some(candidate);
+        }
+    }
+}
+
 impl IdentityClient {
     pub(crate) fn authority_online(&self) -> bool {
         self.state
@@ -237,14 +255,7 @@ impl IdentityClient {
             state.local_use_generation = std::sync::Arc::default();
             crate::screen::close_key(&mut state);
         }
-        state.session_deadline = Some(if state.cached_authority.as_ref() == Some(&anchor) {
-            state
-                .session_deadline
-                .map_or(deadline, |previous| previous.min(deadline))
-        } else {
-            deadline
-        });
-        state.cached_authority = Some(anchor);
+        state.restore_cached_deadline(anchor, deadline);
         state.authority_online = false;
         state.view.authenticated = true;
         state.view.session_verified = false;
@@ -490,6 +501,31 @@ impl IdentityClient {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod local_use_tests {
     use super::*;
+
+    #[test]
+    fn repeated_or_older_receipts_cannot_extend_or_revive_an_in_process_deadline() {
+        use std::time::Duration;
+        let now = crate::Instant::now();
+        let mut state = crate::State::default();
+        let accepted = now + Duration::from_secs(60);
+        state.restore_cached_deadline(("authority".into(), 2000), accepted);
+        for verified in [2000, 1999, 1000, 2000] {
+            state.restore_cached_deadline(
+                ("authority".into(), verified),
+                now + Duration::from_secs(3600),
+            );
+            assert_eq!(state.session_deadline, Some(accepted));
+            assert_eq!(state.cached_authority.as_ref().unwrap().1, 2000);
+        }
+        let renewed = now + Duration::from_secs(120);
+        state.restore_cached_deadline(("authority".into(), 2001), renewed);
+        assert_eq!(state.session_deadline, Some(renewed));
+        state.restore_cached_deadline(("authority".into(), 2000), now + Duration::from_secs(3600));
+        assert_eq!(state.session_deadline, Some(renewed));
+        state.session_deadline = Some(now);
+        state.restore_cached_deadline(("authority".into(), 2001), renewed);
+        assert_eq!(state.session_deadline, Some(now));
+    }
 
     #[test]
     fn legacy_protected_grant_keeps_its_expiry_and_accepts_only_clock_observations() {

@@ -72,7 +72,7 @@ The existing Rust reconciliation owner calls `maintain_authorization`: online
 device verification every five minutes, protected clock checkpoints every minute,
 and a bounded retry after disconnection. Checkpoints never extend a grant; an
 observed clock rollback rejects local use. In-process monotonic deadlines remain
-binding through repeated restores of the same receipt. Resume/network failure
+binding through repeated restores of the same or an older receipt. Resume/network failure
 requires device verification before pending data is uploaded. Renewal preserves
 the original sign-in time used by sensitive actions. Same-session renewal keeps
 local operation lifetimes; sign-out, denial and a replacement session close them.
