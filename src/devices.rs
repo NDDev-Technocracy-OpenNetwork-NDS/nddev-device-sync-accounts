@@ -136,7 +136,7 @@ impl IdentityClient {
                         .await?;
                     return Err(ClientError::DeviceRevoked);
                 }
-                self.persist_offline_authorization().await;
+                self.renew_authorization_inner(&cancel).await?;
                 return Ok(self.view());
             }
             let platform = platform();
@@ -286,7 +286,7 @@ impl IdentityClient {
         Err(ClientError::InvalidResponse)
     }
 
-    async fn update_devices(
+    pub(crate) async fn update_devices(
         &self,
         token: &crate::SessionCredential,
         public: Option<&str>,
@@ -306,7 +306,9 @@ impl IdentityClient {
             return Err(error);
         }
         self.finish_devices(devices, public, cancel)?;
-        self.persist_offline_authorization().await;
+        if has_current {
+            self.renew_authorization_inner(cancel).await?;
+        }
         Ok(self.view())
     }
 
@@ -359,7 +361,7 @@ pub(crate) async fn read_key(
         })
         .transpose()
 }
-fn canonical_bytes<const N: usize>(value: &str) -> Result<[u8; N], ClientError> {
+pub(crate) fn canonical_bytes<const N: usize>(value: &str) -> Result<[u8; N], ClientError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| ClientError::InvalidResponse)?;
