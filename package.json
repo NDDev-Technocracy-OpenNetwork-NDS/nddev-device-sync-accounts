@@ -1,0 +1,16 @@
+{
+  "name": "@nddev/nds-accounts-browser-io",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "packageManager": "bun@1.4.3",
+  "scripts": {
+    "check": "tsc --noEmit && biome check src/*.ts",
+    "generate": "tsc",
+    "check:generated": "tsc && git diff --exit-code -- src/browser_credentials.js src/browser_http.js"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "typescript": "7.0.2"
+  }
+}
