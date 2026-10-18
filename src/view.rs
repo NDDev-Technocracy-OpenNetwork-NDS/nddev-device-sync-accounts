@@ -20,6 +20,8 @@ pub enum ClientError {
     CredentialStore,
     #[error("credential_revalidation_required")]
     RevalidationRequired,
+    #[error("online_verification_required")]
+    OnlineVerificationRequired,
     #[error("challenge_expired")]
     Expired,
     #[error("device_revoked")]

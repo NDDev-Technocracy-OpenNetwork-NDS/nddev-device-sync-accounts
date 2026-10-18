@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
+mod renewal;
 
 /// Opaque point-in-time local-use observation, never a new authorization grant.
 /// Rust callers recheck it around external awaits; no token/key or serializable
@@ -38,7 +39,7 @@ pub struct LocalUseLifetime {
     client: std::sync::Weak<()>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cached {
     schema_version: u8,
@@ -79,6 +80,16 @@ impl Cached {
         fence: &Fence,
         credential: &SessionCredential,
     ) -> Result<(), ClientError> {
+        self.validate_at(origin, fence, credential, now_ms()?)
+    }
+
+    fn validate_at(
+        &self,
+        origin: &str,
+        fence: &Fence,
+        credential: &SessionCredential,
+        now: u64,
+    ) -> Result<(), ClientError> {
         let owner = Owner {
             user_id: UserId::new(&self.session.user_id)
                 .map_err(|_| ClientError::CredentialStore)?,
@@ -89,7 +100,8 @@ impl Cached {
             DeviceId::new(&self.device.device_id).map_err(|_| ClientError::CredentialStore)?;
         let expires = OffsetDateTime::parse(&self.session.expires_at, &Rfc3339)
             .map_err(|_| ClientError::CredentialStore)?;
-        if self.schema_version != 1
+        if !(1..=2).contains(&self.schema_version)
+            || (self.schema_version == 1 && self.authorization.authorization_id.is_some())
             || fence.mode != FenceMode::Ready
             || self.generation != fence.generation
             || !self.device.is_current
@@ -102,22 +114,65 @@ impl Cached {
             return Err(ClientError::RevalidationRequired);
         }
         self.authorization
-            .authorize_offline(origin, &owner, &device, now_ms()?)
+            .authorize_offline(origin, &owner, &device, now)
             .map_err(|_| ClientError::RevalidationRequired)
     }
 }
 
-impl IdentityClient {
-    async fn cached(&self, credential: &SessionCredential) -> Result<Option<Cached>, ClientError> {
-        Ok(self
-            .cached_with_fence(credential)
-            .await?
-            .map(|(cached, _)| cached))
+impl crate::State {
+    fn restore_cached_deadline(&mut self, anchor: (String, u64), candidate: crate::Instant) {
+        if self
+            .cached_authority
+            .as_ref()
+            .is_some_and(|(generation, verified)| generation == &anchor.0 && anchor.1 <= *verified)
+        {
+            self.cached_deadline = Some(
+                self.cached_deadline
+                    .map_or(candidate, |old| old.min(candidate)),
+            );
+        } else {
+            self.cached_authority = Some(anchor);
+            self.cached_deadline = Some(candidate);
+        }
     }
-    async fn cached_with_fence(
-        &self,
-        credential: &SessionCredential,
-    ) -> Result<Option<(Cached, Fence)>, ClientError> {
+}
+
+impl IdentityClient {
+    fn local_deadline_valid(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cached_deadline
+            .is_some_and(|deadline| deadline > crate::Instant::now())
+    }
+    pub(crate) fn authority_online(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .authority_online
+    }
+
+    /// An account inventory response alone cannot reauthorize device traffic.
+    pub fn require_online_verification(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.authority_online = false;
+        state.next_authority_maintenance = None;
+        state.next_authority_verification = None;
+    }
+
+    async fn read_cached_slot(&self, slot: u8) -> Result<Option<Cached>, ClientError> {
+        let Some(secret) = self.store.offline_store(slot).read().await? else {
+            return Ok(None);
+        };
+        if secret.len() > 8192 {
+            return Err(ClientError::CredentialStore);
+        }
+        serde_json::from_slice(&secret)
+            .map(Some)
+            .map_err(|_| ClientError::CredentialStore)
+    }
+
+    async fn ready_fence(&self) -> Result<Option<Fence>, ClientError> {
         let Some(fence) = self.store.authorization_fence(None).await? else {
             return Ok(None);
         };
@@ -134,15 +189,45 @@ impl IdentityClient {
             }
             return Ok(None);
         }
-        let Some(secret) = self.store.offline_store(fence.slot).read().await? else {
+        Ok(Some(fence))
+    }
+
+    async fn cached_with_fence(
+        &self,
+        credential: &SessionCredential,
+    ) -> Result<Option<(Cached, Fence)>, ClientError> {
+        let Some(fence) = self.ready_fence().await? else {
             return Ok(None);
         };
-        if secret.len() > 8192 {
-            return Err(ClientError::CredentialStore);
+        self.cached_at_fence(credential, fence).await
+    }
+
+    async fn cached_at_fence(
+        &self,
+        credential: &SessionCredential,
+        fence: Fence,
+    ) -> Result<Option<(Cached, Fence)>, ClientError> {
+        let Some(cached) = self.read_cached_slot(fence.slot).await? else {
+            return Ok(None);
+        };
+        let now = now_ms()?;
+        if let Err(error) = cached.validate_at(&self.origin(), &fence, credential, now) {
+            if now >= cached.authorization.expires_at_ms {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state
+                    .cached_authority
+                    .as_ref()
+                    .is_some_and(|(generation, _)| generation == &fence.generation)
+                {
+                    let now = crate::Instant::now();
+                    state.cached_deadline =
+                        Some(state.cached_deadline.map_or(now, |old| old.min(now)));
+                    state.authority_online = false;
+                    state.next_authority_maintenance = None;
+                }
+            }
+            return Err(error);
         }
-        let cached: Cached =
-            serde_json::from_slice(&secret).map_err(|_| ClientError::CredentialStore)?;
-        cached.validate(&self.origin(), &fence, credential)?;
         // A sign-out/revocation or slot publication may race a protected-store
         // read. Do not publish a decision from a superseded metadata generation.
         if self.store.authorization_fence(None).await?.as_ref() != Some(&fence) {
@@ -151,107 +236,19 @@ impl IdentityClient {
         Ok(Some((cached, fence)))
     }
 
-    pub(crate) async fn persist_offline_authorization(&self) {
-        let view = self.view();
-        if !view.authenticated
-            || !view.session_verified
-            || !view
-                .devices
-                .iter()
-                .any(|device| device.is_current && !device.revoked)
-        {
-            self.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .view
-                .offline_cache_ready = false;
-            return;
-        }
-        let result = self.persist_offline_inner().await;
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .view
-            .offline_cache_ready = result.is_ok();
-        if let Err(error) = result {
-            tracing::event!(target:"nds_accounts",tracing::Level::WARN, {event.name="identity.offline.persistence_failed",error.type=error.code(),outcome="error"});
-        }
-        // Device/session verification has already completed. A failure to cache
-        // it is an offline-readiness failure, not a failed remote mutation.
-    }
-
-    async fn persist_offline_inner(&self) -> Result<(), ClientError> {
-        let view = self.view();
-        if !view.authenticated || !view.session_verified || view.credential_revalidation_required {
-            return Err(ClientError::RevalidationRequired);
-        }
-        let device = view
-            .devices
-            .iter()
-            .find(|d| d.is_current && !d.revoked)
-            .cloned()
-            .ok_or(ClientError::RevalidationRequired)?;
-        let credential = self.session_credential().await?;
-        let old = self.store.authorization_fence(None).await?;
-        let mut next = Fence::new(FenceMode::Ready)?;
-        next.slot = old.as_ref().map_or(0, |v| 1 - v.slot);
-        let expires = OffsetDateTime::parse(&view.expires_at, &Rfc3339)
-            .map_err(|_| ClientError::InvalidResponse)?;
-        let verified_at_ms = now_ms()?;
-        let remote_expiry: u64 = (expires.unix_timestamp_nanos() / 1_000_000)
-            .try_into()
-            .map_err(|_| ClientError::InvalidResponse)?;
-        let offline_expiry = remote_expiry.min(
-            verified_at_ms.saturating_add(nddev_device_sync_domain::identity::SESSION_LIFETIME_MS),
-        );
-        let cached = Cached {
-            schema_version: 1,
-            generation: next.generation.clone(),
-            authorization: CachedDeviceAuthorization {
-                origin: self.origin(),
-                user_id: UserId::new(&view.user_id).map_err(|_| ClientError::InvalidResponse)?,
-                tenant_id: TenantId::new(&view.tenant_id)
-                    .map_err(|_| ClientError::InvalidResponse)?,
-                device_id: DeviceId::new(&device.device_id)
-                    .map_err(|_| ClientError::InvalidResponse)?,
-                verified_at_ms,
-                expires_at_ms: offline_expiry,
-            },
-            session: wire::Session {
-                user_id: view.user_id,
-                tenant_id: view.tenant_id,
-                expires_at: view.expires_at,
-                auth_method: match view.auth_method.as_str() {
-                    "email_otp" => wire::AuthMethod::EmailOtp,
-                    "github" => wire::AuthMethod::Github,
-                    "passkey" => wire::AuthMethod::Passkey,
-                    _ => return Err(ClientError::InvalidResponse),
-                },
-            },
-            device,
-            credential_fingerprint: credential.fingerprint(),
-            server_version: view.server_version,
-        };
-        cached.validate(&self.origin(), &next, &credential)?;
-        let bytes =
-            Zeroizing::new(serde_json::to_vec(&cached).map_err(|_| ClientError::CredentialStore)?);
-        if bytes.len() > 8192 {
-            return Err(ClientError::CredentialStore);
-        }
-        self.store.offline_store(next.slot).write(&bytes).await?;
-        self.store.authorization_fence(Some((old, next))).await?;
-        tracing::event!(target:"nds_accounts",tracing::Level::INFO, {event.name="identity.offline.prepared",outcome="ok"});
-        Ok(())
-    }
-
     pub(crate) async fn restore_offline(
         &self,
         cancel: &CancellationToken,
     ) -> Result<Option<View>, ClientError> {
+        // A fresh/signed-out installation has no offline capability. Do not
+        // read its native secret backend or mask the original server failure.
+        let Some(fence) = self.ready_fence().await? else {
+            return Ok(None);
+        };
         let Some(credential) = self.stored_session_credential().await? else {
             return Ok(None);
         };
-        let Some(cached) = self.cached(&credential).await? else {
+        let Some((cached, _)) = self.cached_at_fence(&credential, fence).await? else {
             return Ok(None);
         };
         if cancel.is_cancelled() {
@@ -267,8 +264,24 @@ impl IdentityClient {
             deadline.min(crate::Instant::now() + std::time::Duration::from_millis(remaining));
         let checked = i64::try_from(cached.authorization.verified_at_ms / 1000)
             .map_err(|_| ClientError::CredentialStore)?;
+        let _completion = self.cancellation.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel.is_cancelled() {
+            return Err(ClientError::Cancelled);
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = (
+            cached.generation.clone(),
+            cached.authorization.verified_at_ms,
+        );
+        if let Some((generation, _)) = &state.cached_authority
+            && generation != &anchor.0
+        {
+            state.local_use_generation = std::sync::Arc::default();
+            crate::screen::close_key(&mut state);
+        }
+        state.restore_cached_deadline(anchor, deadline);
         state.session_deadline = Some(deadline);
+        state.authority_online = false;
         state.view.authenticated = true;
         state.view.session_verified = false;
         state.view.offline_authorized = true;
@@ -303,6 +316,8 @@ impl IdentityClient {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.view.offline_authorized = false;
         state.view.offline_cache_ready = false;
+        state.authority_online = false;
+        state.next_authority_maintenance = None;
         Ok(())
     }
 
@@ -370,14 +385,10 @@ impl IdentityClient {
         self.check_local_use_generation(&fence.client)?;
         let (cached, durable) = self.authorized_local_with_fence().await?;
         let scope = cached.authorization;
-        if durable != fence.durable
+        if durable.generation != fence.durable.generation
+            || durable.mode != FenceMode::Ready
             || cached.credential_fingerprint != fence.session_binding
-            || scope.origin != fence.scope.origin
-            || scope.user_id != fence.scope.user_id
-            || scope.tenant_id != fence.scope.tenant_id
-            || scope.device_id != fence.scope.device_id
-            || scope.verified_at_ms != fence.scope.verified_at_ms
-            || scope.expires_at_ms != fence.scope.expires_at_ms
+            || !scope.continues(&fence.scope, now_ms()?)
         {
             return Err(ClientError::RevalidationRequired);
         }
@@ -410,6 +421,25 @@ impl IdentityClient {
             .cached_with_fence(&credential)
             .await?
             .ok_or(ClientError::RevalidationRequired)?;
+        let replaced = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let replaced = state
+                .cached_authority
+                .as_ref()
+                .is_some_and(|(generation, _)| generation != &fence.generation);
+            if replaced {
+                state.local_use_generation = std::sync::Arc::default();
+            }
+            replaced
+        };
+        if replaced {
+            self.require_revalidation();
+            return Err(ClientError::RevalidationRequired);
+        }
+        if !self.local_deadline_valid() {
+            self.require_online_verification();
+            return Err(ClientError::RevalidationRequired);
+        }
         let view = self.view();
         if !view.authenticated
             || view.credential_revalidation_required
@@ -500,6 +530,124 @@ impl IdentityClient {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod local_use_tests {
     use super::*;
+
+    #[test]
+    fn repeated_or_older_receipts_cannot_extend_or_revive_an_in_process_deadline() {
+        use std::time::Duration;
+        let now = crate::Instant::now();
+        let mut state = crate::State::default();
+        let accepted = now + Duration::from_secs(60);
+        state.restore_cached_deadline(("authority".into(), 2000), accepted);
+        for verified in [2000, 1999, 1000, 2000] {
+            state.restore_cached_deadline(
+                ("authority".into(), verified),
+                now + Duration::from_secs(3600),
+            );
+            assert_eq!(state.cached_deadline, Some(accepted));
+            assert_eq!(state.cached_authority.as_ref().unwrap().1, 2000);
+        }
+        let renewed = now + Duration::from_secs(120);
+        state.restore_cached_deadline(("authority".into(), 2001), renewed);
+        assert_eq!(state.cached_deadline, Some(renewed));
+        state.restore_cached_deadline(("authority".into(), 2000), now + Duration::from_secs(3600));
+        assert_eq!(state.cached_deadline, Some(renewed));
+        let wall = OffsetDateTime::now_utc();
+        state.view.authenticated = true;
+        state.view.expires_at = wall.format(&Rfc3339).unwrap();
+        crate::expire_session(&mut state, now, wall);
+        assert!(!state.view.authenticated);
+        assert_eq!(state.cached_deadline, Some(now));
+        state.restore_cached_deadline(("authority".into(), 2001), renewed);
+        assert_eq!(state.cached_deadline, Some(now));
+    }
+
+    #[test]
+    fn account_metadata_cannot_extend_an_established_device_deadline() {
+        let client = IdentityClient::new("https://metadata.example").unwrap();
+        let session = wire::Session {
+            user_id: "owner".into(),
+            tenant_id: "tenant".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+            auth_method: wire::AuthMethod::EmailOtp,
+        };
+        let now = crate::Instant::now();
+        let original = now + std::time::Duration::from_secs(60);
+        client.set_session(session.clone(), original, false);
+        assert!(!client.local_deadline_valid());
+        client.state.lock().unwrap().cached_authority = Some(("accepted".into(), 2000));
+        client.state.lock().unwrap().cached_deadline = Some(original);
+        client.set_session(session, now + std::time::Duration::from_secs(3600), true);
+        assert_eq!(client.state.lock().unwrap().cached_deadline, Some(original));
+        client.state.lock().unwrap().cached_deadline = Some(now);
+        assert!(!client.local_deadline_valid());
+        assert!(
+            client.device_store().is_ok(),
+            "active account can still obtain device proof"
+        );
+    }
+
+    #[test]
+    fn legacy_protected_grant_keeps_its_expiry_and_accepts_only_clock_observations() {
+        let credential =
+            SessionCredential::Bearer(Zeroizing::new("generated-invalid-test-value".into()));
+        let fence = Fence::new(FenceMode::Ready).unwrap();
+        let verified = 1_900_000_000_000;
+        let expiry = verified + 8 * 60 * 60 * 1000;
+        let mut value = serde_json::json!({
+            "schema_version":1,"generation":fence.generation,
+            "authorization":{"origin":"https://legacy.example","user_id":"owner","tenant_id":"tenant",
+                "device_id":"device","verified_at_ms":verified,"expires_at_ms":expiry},
+            "session":{"user_id":"owner","tenant_id":"tenant","auth_method":"email_otp",
+                "expires_at":OffsetDateTime::from_unix_timestamp_nanos(i128::from(expiry)*1_000_000).unwrap().format(&Rfc3339).unwrap()},
+            "device":{"device_id":"device","display_name":"Owned test","platform":"linux",
+                "revoked":false,"is_current":true,"created_at":"2030-01-01T00:00:00Z"},
+            "credential_fingerprint":credential.fingerprint(),"server_version":"test"
+        });
+        let mut cached: Cached = serde_json::from_value(value.clone()).unwrap();
+        assert!(cached.authorization.authorization_id.is_none());
+        assert!(
+            cached
+                .validate_at("https://legacy.example", &fence, &credential, expiry - 1)
+                .is_ok()
+        );
+        assert_eq!(
+            cached.validate_at("https://legacy.example", &fence, &credential, expiry),
+            Err(ClientError::RevalidationRequired)
+        );
+        cached
+            .authorization
+            .observe_clock(verified + 60_000)
+            .unwrap();
+        assert_eq!(cached.authorization.expires_at_ms, expiry);
+        assert_eq!(cached.authorization.verified_at_ms, verified);
+        assert!(
+            cached
+                .validate_at(
+                    "https://legacy.example",
+                    &fence,
+                    &credential,
+                    verified + 59_999
+                )
+                .is_err()
+        );
+        assert!(
+            cached
+                .validate_at(
+                    "https://other.example",
+                    &fence,
+                    &credential,
+                    verified + 60_000
+                )
+                .is_err()
+        );
+        value["authorization"]["authorization_id"] = serde_json::json!(vec![1; 32]);
+        let wrong: Cached = serde_json::from_value(value).unwrap();
+        assert!(
+            wrong
+                .validate_at("https://legacy.example", &fence, &credential, verified)
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn pre_enrollment_lifetime_cannot_cross_client_or_survive_cancel() {
@@ -722,6 +870,53 @@ mod acceptance {
             assert_eq!(refreshed.current_device_id, enrolled.current_device_id);
             assert_eq!(refreshed.devices_checked_at, enrolled.devices_checked_at);
             client.authorize_local().await.unwrap();
+            let captured = client.local_use_fence().await.unwrap();
+            let before = client
+                .cached_with_fence(&client.session_credential().await.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            {
+                let mut state = client.state.lock().unwrap();
+                state.next_authority_maintenance = None;
+            }
+            client.maintain_authorization().await.unwrap();
+            let renewed = client
+                .cached_with_fence(&client.session_credential().await.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(before.1.generation, renewed.1.generation);
+            assert_ne!(before.1.slot, renewed.1.slot);
+            assert_eq!(
+                before.0.authorization.authorization_id,
+                renewed.0.authorization.authorization_id
+            );
+            assert!(
+                renewed.0.authorization.verified_at_ms >= before.0.authorization.verified_at_ms
+            );
+            assert!(renewed.0.authorization.expires_at_ms >= before.0.authorization.expires_at_ms);
+            client.validate_local_use(&captured).await.unwrap();
+            {
+                let (_permit, cancel) = client.operation().await.unwrap();
+                client.checkpoint_authorization(&cancel).await.unwrap();
+            }
+            let checkpoint = client
+                .cached_with_fence(&client.session_credential().await.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                checkpoint.0.authorization.verified_at_ms,
+                renewed.0.authorization.verified_at_ms
+            );
+            assert_eq!(
+                checkpoint.0.authorization.expires_at_ms,
+                renewed.0.authorization.expires_at_ms
+            );
+            assert_eq!(checkpoint.1.generation, renewed.1.generation);
+            assert_ne!(checkpoint.1.slot, renewed.1.slot);
+            client.validate_local_use(&captured).await.unwrap();
             let key = client
                 .device_store()
                 .unwrap()
@@ -738,9 +933,55 @@ mod acceptance {
                 offline.authenticated && offline.offline_authorized && !offline.session_verified
             );
             assert_eq!(offline.current_device_id, enrolled.current_device_id);
-            assert_eq!(offline.expires_at, enrolled.expires_at);
+            assert_eq!(offline.expires_at, renewed.0.session.expires_at);
             assert!(offline.session_checked_at <= OffsetDateTime::now_utc().unix_timestamp());
             recreated.authorize_local().await.unwrap();
+            assert!(matches!(
+                recreated
+                    .sync_request(crate::SyncRequest::Page { after: 0, limit: 1 })
+                    .await,
+                Err(ClientError::OnlineVerificationRequired)
+            ));
+            let deadline = recreated.state.lock().unwrap().cached_deadline.unwrap();
+            recreated
+                .restore_offline(&CancellationToken::new())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(recreated.state.lock().unwrap().cached_deadline.unwrap() <= deadline);
+            recreated.maintain_authorization().await.unwrap();
+            let offline_cache = recreated
+                .cached_with_fence(&recreated.session_credential().await.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                offline_cache.0.authorization.verified_at_ms,
+                checkpoint.0.authorization.verified_at_ms
+            );
+            assert_eq!(
+                offline_cache.0.authorization.expires_at_ms,
+                checkpoint.0.authorization.expires_at_ms
+            );
+            let offline_use = recreated.local_use_fence().await.unwrap();
+            set_mode(&receipt, &control, "online").await;
+            recreated.require_online_verification();
+            let connected = recreated.maintain_authorization().await.unwrap();
+            assert!(
+                connected.session_verified
+                    && connected.offline_cache_ready
+                    && !connected.offline_authorized
+            );
+            recreated.validate_local_use(&offline_use).await.unwrap();
+            assert_eq!(
+                recreated
+                    .sync_request(crate::SyncRequest::Page { after: 0, limit: 1 })
+                    .await
+                    .unwrap()
+                    .status,
+                200
+            );
+            set_mode(&receipt, &control, "offline").await;
             process_spans(&feed);
             let signed_out = recreated.logout().await.unwrap();
             assert_recovered_operation(&feed);

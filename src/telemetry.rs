@@ -237,7 +237,7 @@ async fn run(
                     checked = Some(Instant::now());
                 }
                 Err(error) if terminal(&error) => break,
-                Err(ClientError::Busy) => {
+                Err(ClientError::Busy | ClientError::OnlineVerificationRequired) => {
                     delay = Duration::from_secs(1);
                     continue;
                 }
@@ -312,7 +312,7 @@ async fn run(
                 delay = Duration::ZERO;
             }
             Err(error) if terminal(&error) => break,
-            Err(ClientError::Busy) => {
+            Err(ClientError::Busy | ClientError::OnlineVerificationRequired) => {
                 Batch::park(&mut pending);
                 delay = Duration::from_secs(1);
             }

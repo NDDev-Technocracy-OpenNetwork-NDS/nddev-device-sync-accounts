@@ -95,6 +95,13 @@ struct State {
     view: View,
     flow: Option<Flow>,
     session_deadline: Option<Instant>,
+    // Observations, never independent authority. Only a new protected server
+    // receipt can extend an accepted deadline; a clock checkpoint cannot.
+    cached_authority: Option<(String, u64)>,
+    cached_deadline: Option<Instant>,
+    authority_online: bool,
+    next_authority_maintenance: Option<Instant>,
+    next_authority_verification: Option<Instant>,
     // Local-use handles expire on client cancellation, independently of request
     // tokens that rotate for each NDS operation. No authority is stored here.
     local_use_generation: Arc<()>,
@@ -230,7 +237,7 @@ impl IdentityClient {
     async fn refresh_operation(&self) -> Result<View, ClientError> {
         let (_permit, cancel) = self.operation().await?;
         let result = self.refresh_online(&cancel).await;
-        if matches!(&result, Err(ClientError::Transport | ClientError::Timeout))
+        if result.as_ref().is_err_and(online_unavailable)
             && let Some(view) = self.restore_offline(&cancel).await?
         {
             return Ok(view);
@@ -242,6 +249,7 @@ impl IdentityClient {
     }
 
     async fn refresh_online(&self, cancel: &CancellationToken) -> Result<View, ClientError> {
+        self.require_online_verification();
         let signed_out = self.finish_pending_logout(cancel).await?;
         self.state
             .lock()
@@ -841,10 +849,25 @@ impl IdentityClient {
     }
 
     fn set_session(&self, session: wire::Session, deadline: Instant, preserve_devices: bool) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::set_session_state(
+            &mut self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            session,
+            deadline,
+            preserve_devices,
+        );
+    }
+
+    fn set_session_state(
+        s: &mut State,
+        session: wire::Session,
+        deadline: Instant,
+        preserve_devices: bool,
+    ) {
         let preserve_devices = preserve_devices
             && s.view.user_id == session.user_id
             && s.view.tenant_id == session.tenant_id;
+        // Account authentication and local active-device authority have
+        // independent deadlines. Metadata never changes cached_deadline.
         s.session_deadline = Some(deadline);
         s.view.authenticated = true;
         s.view.session_verified = true;
@@ -856,6 +879,11 @@ impl IdentityClient {
             // A newly accepted sign-in owns a new local lifetime, even for the
             // same owner. Late work from the preceding session cannot publish.
             s.local_use_generation = Arc::default();
+            s.cached_authority = None;
+            s.cached_deadline = None;
+            s.authority_online = false;
+            s.next_authority_maintenance = None;
+            s.next_authority_verification = None;
             s.view.offline_cache_ready = false;
             s.view.current_device_id.clear();
             s.view.devices.clear();
@@ -878,6 +906,11 @@ impl IdentityClient {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         screen::close_key(&mut s);
         s.session_deadline = None;
+        s.cached_authority = None;
+        s.cached_deadline = None;
+        s.authority_online = false;
+        s.next_authority_maintenance = None;
+        s.next_authority_verification = None;
         s.view.authenticated = false;
         s.view.session_verified = false;
         s.view.offline_authorized = false;
@@ -897,6 +930,9 @@ impl IdentityClient {
         self.clear_flow();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.view.session_verified = false;
+        state.authority_online = false;
+        state.next_authority_maintenance = None;
+        state.next_authority_verification = None;
         screen::close_key(&mut state);
         state.view.credential_revalidation_required = true;
         state.view.offline_authorized = false;
@@ -1086,6 +1122,12 @@ impl IdentityClient {
             _ = cancel.cancelled() => Err(ClientError::Cancelled),
             result = runtime::timeout(REQUEST_TIMEOUT, operation) => result.unwrap_or(Err(ClientError::Timeout)),
         };
+        // A module dependency (for example the telemetry collector) can fail
+        // while NDS identity is reachable. Only loss of this connection closes
+        // online admission; explicit refresh/renewal owns its wider fallback.
+        if matches!(&result, Err(ClientError::Transport | ClientError::Timeout)) {
+            self.require_online_verification();
+        }
         match &result {
             Ok((status, _)) => tracing::event!(target: "nds_accounts", tracing::Level::INFO,
                 { event.name = "identity.request_completed", route, status = status.as_u16(),
@@ -1118,9 +1160,16 @@ fn terminal_identity_failure(error: &ClientError) -> bool {
         | ClientError::Cancelled
         | ClientError::Busy
         | ClientError::RevalidationRequired
+        | ClientError::OnlineVerificationRequired
         | ClientError::Expired
         | ClientError::DeviceRevoked => false,
     }
+}
+
+fn online_unavailable(error: &ClientError) -> bool {
+    matches!(error, ClientError::Transport | ClientError::Timeout)
+        || matches!(error, ClientError::Server(code) if matches!(code.as_str(),
+            "dependency_unavailable" | "server_busy" | "request_timeout" | "rate_limited"))
 }
 
 #[cfg(test)]
@@ -1144,6 +1193,7 @@ mod operation_outcome_tests {
             ClientError::Cancelled,
             ClientError::Busy,
             ClientError::RevalidationRequired,
+            ClientError::OnlineVerificationRequired,
             ClientError::Expired,
             ClientError::DeviceRevoked,
         ] {
@@ -1262,14 +1312,25 @@ fn expire_session(state: &mut State, now: Instant, wall_time: OffsetDateTime) {
             .session_deadline
             .is_some_and(|deadline| deadline <= now)
             || OffsetDateTime::parse(&state.view.expires_at, &Rfc3339)
-                .is_ok_and(|expires| expires <= wall_time))
+                .is_ok_and(|expires| expires <= wall_time)
+            || (state.view.offline_authorized
+                && state
+                    .cached_deadline
+                    .is_some_and(|deadline| deadline <= now)))
     {
         screen::close_key(state);
         state.view.authenticated = false;
         state.view.session_verified = false;
         state.view.offline_authorized = false;
         state.view.offline_cache_ready = false;
+        // Latch an observed expiry even when suspension advanced only the wall
+        // clock. Rolling it back cannot revive the same cached authorization.
+        if state.cached_authority.is_some() {
+            state.cached_deadline = Some(state.cached_deadline.map_or(now, |old| old.min(now)));
+        }
         state.session_deadline = None;
+        state.authority_online = false;
+        state.next_authority_maintenance = None;
     }
 }
 
@@ -1512,9 +1573,13 @@ mod native_completion_tests {
             user_id: "owner".into(),
             tenant_id: "tenant".into(),
             auth_method: wire::AuthMethod::EmailOtp,
-            expires_at: (OffsetDateTime::now_utc() + time::Duration::hours(9))
-                .format(&Rfc3339)
-                .unwrap(),
+            expires_at: (OffsetDateTime::now_utc()
+                + time::Duration::milliseconds(
+                    nddev_device_sync_domain::identity::SESSION_LIFETIME_MS as i64,
+                )
+                + time::Duration::hours(1))
+            .format(&Rfc3339)
+            .unwrap(),
         };
         assert_eq!(
             validate_session(&session),
