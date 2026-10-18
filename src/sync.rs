@@ -16,6 +16,8 @@ pub(crate) struct SigningContext {
 
 /// A compiled-in route set, never an arbitrary URL or authenticated HTTP proxy.
 pub enum SyncRequest {
+    /// Bootstrap verification only; never a user-data mutation or a credential.
+    SessionRenewal,
     Company(crate::company::CompanyRequest),
     Append(Vec<u8>),
     Page {
@@ -62,6 +64,7 @@ impl SyncRequest {
     }
     fn prepare(self) -> Result<(Method, String, Option<Vec<u8>>), ClientError> {
         match self {
+            Self::SessionRenewal => Ok((Method::POST, "/v2/session/renew".into(), None)),
             Self::Company(request) => request.prepare(),
             SyncRequest::Telemetry(body) => {
                 if body.is_empty() || body.len() > 65_536 {
@@ -272,6 +275,9 @@ impl IdentityClient {
     ) -> Result<zeroize::Zeroizing<Vec<u8>>, ClientError> {
         let (_permit, cancel) = self.operation().await?;
         self.validate_local_use(fence).await?;
+        if !self.authority_online() {
+            return Err(ClientError::OnlineVerificationRequired);
+        }
         let view = self.view();
         let current = view
             .devices
@@ -387,12 +393,26 @@ impl IdentityClient {
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
         let (_permit, cancel) = self.operation().await?;
-        let fence = if request.is_v3() || matches!(&request, SyncRequest::Company(_)) {
+        self.signed_request_inner(request, &cancel).await
+    }
+
+    pub(crate) async fn signed_request_inner(
+        &self,
+        request: SyncRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<SyncReply, ClientError> {
+        let renewal = matches!(&request, SyncRequest::SessionRenewal);
+        let fence = if renewal {
+            None
+        } else if request.is_v3() || matches!(&request, SyncRequest::Company(_)) {
             Some(self.local_use_fence().await?)
         } else {
             self.authorize_local().await?;
             None
         };
+        if !renewal && !self.authority_online() {
+            return Err(ClientError::OnlineVerificationRequired);
+        }
         let store = self.device_store()?;
         let view = self.view();
         let current = view
@@ -445,7 +465,7 @@ impl IdentityClient {
                     locale: "en",
                     signature: Some(signature),
                 },
-                &cancel,
+                cancel,
             )
             .await;
         if let Some(fence) = &fence {

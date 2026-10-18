@@ -55,8 +55,10 @@ The pinned TypeScript compiler emits the existing Rust-imported JS paths;
 the frozen Bun lockfile. Only string-valued allowlisted request headers cross
 this boundary; malformed values are rejected rather than coerced.
 
-After real session and active-device verification, the client can restore a
-scoped offline authorization until the original session expiry. Two protected
+After a signed active-device renewal, the client can restore scoped offline
+authorization for at most seven days. Account inventory alone cannot renew it.
+Older cached grants retain their original shorter expiry until the server
+verifies them again. Two protected
 grant slots and an atomic generation pointer preserve the previous grant across
 an interrupted replacement. The metadata pointer contains no credentials.
 `View` distinguishes current server verification, cached offline authorization
@@ -65,6 +67,17 @@ prevents automatic reuse of a retained cookie. Browser logout removes cached
 vault keys/grants while preserving device identity and encrypted unsent data.
 `authorize_local` is the local secret/replica consumer gate, including changes
 made by another process/tab. Offline availability does not assert server freshness.
+
+The existing Rust reconciliation owner calls `maintain_authorization`: online
+device verification every five minutes, protected clock checkpoints every minute,
+and a bounded retry after disconnection. Checkpoints never extend a grant; an
+observed clock rollback rejects local use. In-process monotonic deadlines remain
+binding through repeated restores of the same receipt. Resume/network failure
+requires device verification before pending data is uploaded. Renewal preserves
+the original sign-in time used by sensitive actions. Same-session renewal keeps
+local operation lifetimes; sign-out, denial and a replacement session close them.
+No new background service is created, and these checks do not provide a trusted
+clock against a compromised OS or browser profile.
 
 `just wasm-check` compiles the browser adapter. Actual browser cookie, native
 keyring, offline restart and later pipeline acceptance remain separate gates.
