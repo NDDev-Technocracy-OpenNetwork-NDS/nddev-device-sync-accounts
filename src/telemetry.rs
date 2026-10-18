@@ -178,7 +178,10 @@ async fn run(
                     .try_into()
                     .unwrap_or_default();
             }
-            delay = Duration::from_millis(200);
+            // A receipt releases the next bounded batch immediately. Sparse
+            // ingress can create small batches; a success delay would cap their
+            // throughput below ordinary background events even with healthy I/O.
+            delay = Duration::ZERO;
             continue;
         }
         if pending.as_ref().is_some_and(Batch::expired)
