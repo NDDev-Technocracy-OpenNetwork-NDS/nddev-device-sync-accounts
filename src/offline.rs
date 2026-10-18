@@ -522,9 +522,34 @@ mod local_use_tests {
         assert_eq!(state.session_deadline, Some(renewed));
         state.restore_cached_deadline(("authority".into(), 2000), now + Duration::from_secs(3600));
         assert_eq!(state.session_deadline, Some(renewed));
-        state.session_deadline = Some(now);
+        let wall = OffsetDateTime::now_utc();
+        state.view.authenticated = true;
+        state.view.expires_at = wall.format(&Rfc3339).unwrap();
+        crate::expire_session(&mut state, now, wall);
+        assert!(!state.view.authenticated);
+        assert_eq!(state.session_deadline, Some(now));
         state.restore_cached_deadline(("authority".into(), 2001), renewed);
         assert_eq!(state.session_deadline, Some(now));
+    }
+
+    #[test]
+    fn account_metadata_cannot_extend_an_established_device_deadline() {
+        let client = IdentityClient::new("https://metadata.example").unwrap();
+        let session = wire::Session {
+            user_id: "owner".into(),
+            tenant_id: "tenant".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+            auth_method: wire::AuthMethod::EmailOtp,
+        };
+        let now = crate::Instant::now();
+        let original = now + std::time::Duration::from_secs(60);
+        client.set_session(session.clone(), original, false);
+        client.state.lock().unwrap().cached_authority = Some(("accepted".into(), 2000));
+        client.set_session(session, now + std::time::Duration::from_secs(3600), true);
+        assert_eq!(
+            client.state.lock().unwrap().session_deadline,
+            Some(original)
+        );
     }
 
     #[test]

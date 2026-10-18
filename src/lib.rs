@@ -848,11 +848,30 @@ impl IdentityClient {
     }
 
     fn set_session(&self, session: wire::Session, deadline: Instant, preserve_devices: bool) {
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::set_session_state(
+            &mut self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            session,
+            deadline,
+            preserve_devices,
+        );
+    }
+
+    fn set_session_state(
+        s: &mut State,
+        session: wire::Session,
+        deadline: Instant,
+        preserve_devices: bool,
+    ) {
         let preserve_devices = preserve_devices
             && s.view.user_id == session.user_id
             && s.view.tenant_id == session.tenant_id;
-        s.session_deadline = Some(deadline);
+        // Account metadata is not a new active-device receipt.
+        s.session_deadline = Some(if preserve_devices && s.cached_authority.is_some() {
+            s.session_deadline
+                .map_or(deadline, |previous| previous.min(deadline))
+        } else {
+            deadline
+        });
         s.view.authenticated = true;
         s.view.session_verified = true;
         s.view.offline_authorized = false;
@@ -1301,7 +1320,9 @@ fn expire_session(state: &mut State, now: Instant, wall_time: OffsetDateTime) {
         state.view.session_verified = false;
         state.view.offline_authorized = false;
         state.view.offline_cache_ready = false;
-        state.session_deadline = None;
+        // Latch an observed expiry even when suspension advanced only the wall
+        // clock. Rolling it back cannot revive the same cached authorization.
+        state.session_deadline = Some(state.session_deadline.map_or(now, |old| old.min(now)));
         state.authority_online = false;
         state.next_authority_maintenance = None;
     }

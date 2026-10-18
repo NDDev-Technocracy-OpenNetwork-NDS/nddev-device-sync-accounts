@@ -216,6 +216,12 @@ impl IdentityClient {
             server_version: view.server_version,
         };
         cached.validate(&self.origin(), &next, &credential)?;
+        let remaining = cached
+            .authorization
+            .expires_at_ms
+            .checked_sub(now_ms()?)
+            .ok_or(ClientError::RevalidationRequired)?;
+        let deadline = deadline.min(Instant::now() + Duration::from_millis(remaining));
         if let Err(error) = self.publish_cached(old, next, &cached, cancel).await {
             self.state
                 .lock()
@@ -230,8 +236,10 @@ impl IdentityClient {
         if cancel.is_cancelled() {
             return Err(ClientError::Cancelled);
         }
-        self.set_session(receipt.session, deadline, true);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::set_session_state(&mut state, receipt.session, deadline, true);
+        // Only this accepted, protected device receipt may extend the deadline.
+        state.session_deadline = Some(deadline);
         if state
             .cached_authority
             .as_ref()
