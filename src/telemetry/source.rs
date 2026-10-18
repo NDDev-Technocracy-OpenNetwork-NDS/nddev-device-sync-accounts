@@ -263,7 +263,12 @@ impl Source {
                 }
                 let _ = source.report_losses().await;
                 if !work {
-                    tokio::select! { _=cancel.cancelled()=>break, _=crate::runtime::sleep(std::time::Duration::from_millis(200))=>{} }
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = source.events.ready() => {},
+                        _ = source.traces.ready() => {},
+                        _ = crate::runtime::sleep(std::time::Duration::from_millis(200)) => {},
+                    }
                 }
             }
             // Closing RAM capture can account for previously unstaged records.
