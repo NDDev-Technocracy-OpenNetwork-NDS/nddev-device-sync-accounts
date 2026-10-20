@@ -117,9 +117,11 @@ health, so partial acceptance does not claim a new full-success timestamp.
 The ignored `actual_signed_client_delivery_and_incidents` test requires owned
 server and observability fixture receipts through `NDS_FIXTURE_RECEIPT` and
 `NDS_OBSERVABILITY_FIXTURE_RECEIPT`. It exercises real native credentials, signed
-HTTP, PostgreSQL, Vector and searchable OpenObserve spans, incident replay and
-resolution, background/resume and absence of recursive export. Fixture credentials
-and generated identities remain outside public source.
+HTTP, PostgreSQL, Vector and searchable OpenObserve spans and logs, incident
+replay and resolution, background/resume, a real server disconnect
+and restart, and absence of recursive export. Reconnection uses the application's
+existing authorization reconciliation; the exporter cannot bypass that owner.
+Fixture credentials and generated identities remain outside public source.
 
 Owners can list passkey fingerprints/registration times and remove a credential
 through the native client. Removal requires a fresh server-verified session and
