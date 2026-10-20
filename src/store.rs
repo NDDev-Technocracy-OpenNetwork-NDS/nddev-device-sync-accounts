@@ -28,6 +28,29 @@ const SERVICE: &str = "ai.nddev.nds.session.v2";
 const MAX_IO_REQUESTS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Repeated reads are diagnostics; mutations and all failures remain normal-mode
+// audit events. Native and browser adapters use the same completion policy.
+fn report_io<T>(event: &'static str, result: &Result<T, ClientError>, duration_ms: u64) {
+    match result {
+        Ok(_)
+            if matches!(
+                event,
+                "identity.credential.read" | "identity.offline.fence.read"
+            ) =>
+        {
+            tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
+                event.name=event, duration_ms, outcome="ok"
+            });
+        }
+        Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
+            event.name=event, duration_ms, outcome="ok"
+        }),
+        Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+            event.name=event, duration_ms, error.type=error.code(), outcome="error"
+        }),
+    }
+}
+
 struct IoPermit {
     _serial: OwnedSemaphorePermit,
     _request: OwnedSemaphorePermit,
@@ -186,27 +209,20 @@ impl SessionStore {
         let work = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
                 worker_span.in_scope(|| {
-            let _permit = permit;
-            let _owner = owner;
-            let _lease = lease;
-            let started = Instant::now();
+                    let _permit = permit;
+                    let _owner = owner;
+                    let _lease = lease;
+                    let started = Instant::now();
                     tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
                         event.name=event, outcome="started"
                     });
-            let result = action(service, &key);
-            // This is the actual OS completion, including a late completion
-            // after the waiting caller timed out or was cancelled. No key,
-            // endpoint, value, presence flag or provider error text is emitted.
-            match &result {
-                Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
-                    event.name=event, duration_ms=started.elapsed().as_millis() as u64, outcome="ok"
-                }),
-                Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                    event.name=event, duration_ms=started.elapsed().as_millis() as u64, error.type=error.code(), outcome="error"
-                }),
-            }
-            result
-        })
+                    let result = action(service, &key);
+                    // This is the actual OS completion, including a late completion
+                    // after the waiting caller timed out or was cancelled. No key,
+                    // endpoint, value, presence flag or provider error text is emitted.
+                    report_io(event, &result, started.elapsed().as_millis() as u64);
+                    result
+                })
             })
         });
         match tokio::time::timeout(remaining, work).await {

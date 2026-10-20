@@ -214,44 +214,48 @@ mod native {
 }
 
 impl SessionStore {
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn authorization_fence(
         &self,
         change: Option<(Option<Fence>, Fence)>,
     ) -> Result<Option<Fence>, ClientError> {
-        self.run_io("identity.offline.fence", move |_, key| {
-            let path = crate::private_data_directory()?
-                .join("identity")
-                .join(format!("{key}.db"));
-            native::operate(&path, change)
-        })
-        .await
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn authorization_fence(
-        &self,
-        change: Option<(Option<Fence>, Fence)>,
-    ) -> Result<Option<Fence>, ClientError> {
-        use wasm_bindgen::prelude::*;
-        #[wasm_bindgen(module = "/src/browser_credentials.js")]
-        extern "C" {
-            #[wasm_bindgen(catch, js_name = authorizationFence)]
-            fn fence(key: &str, change: &str) -> Result<js_sys::Promise, JsValue>;
+        let event = if change.is_some() {
+            "identity.offline.fence"
+        } else {
+            "identity.offline.fence.read"
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.run_io(event, move |_, key| {
+                let path = crate::private_data_directory()?
+                    .join("identity")
+                    .join(format!("{key}.db"));
+                native::operate(&path, change)
+            })
+            .await
         }
-        let change = serde_json::to_string(&change).map_err(|_| ClientError::CredentialStore)?;
-        let key = self.key.clone();
-        self.browser_io("identity.offline.fence", async move {
-            let promise = fence(&key, &change).map_err(super::browser::failure)?;
-            let output = wasm_bindgen_futures::JsFuture::from(promise)
-                .await
-                .map_err(super::browser::failure)?;
-            let output = output
-                .as_string()
-                .filter(|s| s.len() <= 256)
-                .ok_or(ClientError::CredentialStore)?;
-            serde_json::from_str(&output).map_err(|_| ClientError::CredentialStore)
-        })
-        .await
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::prelude::*;
+            #[wasm_bindgen(module = "/src/browser_credentials.js")]
+            extern "C" {
+                #[wasm_bindgen(catch, js_name = authorizationFence)]
+                fn fence(key: &str, change: &str) -> Result<js_sys::Promise, JsValue>;
+            }
+            let change =
+                serde_json::to_string(&change).map_err(|_| ClientError::CredentialStore)?;
+            let key = self.key.clone();
+            self.browser_io(event, async move {
+                let promise = fence(&key, &change).map_err(super::browser::failure)?;
+                let output = wasm_bindgen_futures::JsFuture::from(promise)
+                    .await
+                    .map_err(super::browser::failure)?;
+                let output = output
+                    .as_string()
+                    .filter(|s| s.len() <= 256)
+                    .ok_or(ClientError::CredentialStore)?;
+                serde_json::from_str(&output).map_err(|_| ClientError::CredentialStore)
+            })
+            .await
+        }
     }
 }

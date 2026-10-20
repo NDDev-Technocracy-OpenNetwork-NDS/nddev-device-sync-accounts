@@ -82,6 +82,11 @@ clock against a compromised OS or browser profile.
 `just wasm-check` compiles the browser adapter. Actual browser cookie, native
 keyring, offline restart and later pipeline acceptance remain separate gates.
 
+Successful credential and authorization-fence reads are bounded `io` debug
+diagnostics. Mutations, admission and every I/O failure remain normal-mode
+events; correlated operation spans remain available in both modes. Fence reads
+use `identity.offline.fence.read`, distinct from the mutation audit event.
+
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
 agent consumers. The SDK owns redaction and record lifetimes; the sender checks
 the narrow `/v2/observability/client-policy` export policy, pauses in the background and uses bounded backoff with
