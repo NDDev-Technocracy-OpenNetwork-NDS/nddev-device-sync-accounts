@@ -28,25 +28,45 @@ const SERVICE: &str = "ai.nddev.nds.session.v2";
 const MAX_IO_REQUESTS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn diagnostic_read(event: &str) -> bool {
+    matches!(
+        event,
+        "identity.credential.read" | "identity.offline.fence.read"
+    )
+}
+
+fn io_span(event: &str) -> Result<tracing::Span, ClientError> {
+    use opentelemetry::trace::TraceContextExt;
+    let parent = tracing::Span::current();
+    // A useful operation must fit the bounded feed without exporting a span
+    // for every repeated key/fence lookup. Keep its actual parent correlation;
+    // standalone reads still create a trace. Delivery suppression is inherited.
+    if diagnostic_read(event)
+        && nddev_device_sync_telemetry::trace_context(&parent)
+            .span()
+            .span_context()
+            .is_valid()
+    {
+        return Ok(parent);
+    }
+    nddev_device_sync_telemetry::operation_span("accounts", "io")
+        .map_err(|_| ClientError::TelemetryUnavailable)
+}
+
 // Repeated reads are diagnostics; mutations and all failures remain normal-mode
 // audit events. Native and browser adapters use the same completion policy.
 fn report_io<T>(event: &'static str, result: &Result<T, ClientError>, duration_ms: u64) {
     match result {
-        Ok(_)
-            if matches!(
-                event,
-                "identity.credential.read" | "identity.offline.fence.read"
-            ) =>
-        {
+        Ok(_) if diagnostic_read(event) => {
             tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
-                event.name=event, duration_ms, outcome="ok"
+                event.name=event, module="accounts", scope="io", duration_ms, outcome="ok"
             });
         }
         Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
-            event.name=event, duration_ms, outcome="ok"
+            event.name=event, module="accounts", scope="io", duration_ms, outcome="ok"
         }),
         Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-            event.name=event, duration_ms, error.type=error.code(), outcome="error"
+            event.name=event, module="accounts", scope="io", duration_ms, error.type=error.code(), outcome="error"
         }),
     }
 }
@@ -158,7 +178,7 @@ impl SessionStore {
         let started = crate::runtime::Instant::now();
         let rejected = |error: ClientError| {
             span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                event.name="identity.credential.admission_rejected", error.type=error.code(), outcome="rejected"
+                event.name="identity.credential.admission_rejected", module="accounts", scope="io", error.type=error.code(), outcome="rejected"
             }));
             error
         };
@@ -191,8 +211,7 @@ impl SessionStore {
         event: &'static str,
         action: impl FnOnce(&'static str, &str) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
-        let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
-            .map_err(|_| ClientError::TelemetryUnavailable)?;
+        let span = io_span(event)?;
         let (permit, remaining) = self.admit_io(&span).await?;
         let key = self.key.clone();
         let service = self.service;
@@ -214,7 +233,7 @@ impl SessionStore {
                     let _lease = lease;
                     let started = Instant::now();
                     tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
-                        event.name=event, outcome="started"
+                        event.name=event, module="accounts", scope="io", outcome="started"
                     });
                     let result = action(service, &key);
                     // This is the actual OS completion, including a late completion
@@ -234,7 +253,7 @@ impl SessionStore {
                     ClientError::CredentialStore
                 };
                 span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                    event.name="identity.credential.wait_failed", error.type=error.code(), outcome="error"
+                    event.name="identity.credential.wait_failed", module="accounts", scope="io", error.type=error.code(), outcome="error"
                 }));
                 Err(error)
             }

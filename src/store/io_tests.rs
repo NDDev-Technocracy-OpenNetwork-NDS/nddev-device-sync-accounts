@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
+    use nddev_device_sync_telemetry::client_traces::ClientTraces;
     use nddev_device_sync_telemetry::{Config, DebugWindow};
-    use opentelemetry::trace::TracerProvider;
+    use opentelemetry::trace::TraceContextExt;
     #[derive(Clone)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Capture {
@@ -21,45 +22,44 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
         }
     }
     let output = Arc::new(Mutex::new(Vec::new()));
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-    let (subscriber, control) = nddev_device_sync_telemetry::subscriber(
-        Config {
-            service: "nds-store-policy-acceptance".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts".into(),
-            commit: "unknown".into(),
-            channel: "alpha".into(),
-            standards: "unreleased".into(),
-            environment: "test".into(),
-            target_prefixes: vec!["nds_accounts".into()],
-            default_module: "accounts".into(),
-            debug: None,
-        },
-        Capture(output.clone()),
-        provider.tracer("store-policy-acceptance"),
-    )
-    .unwrap();
+    let config = Config {
+        service: "nds-store-policy-acceptance".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts".into(),
+        commit: "unknown".into(),
+        channel: "alpha".into(),
+        standards: "unreleased".into(),
+        environment: "test".into(),
+        target_prefixes: vec!["nds_accounts".into()],
+        default_module: "accounts".into(),
+        debug: None,
+    };
+    let traces = ClientTraces::new(&config).unwrap();
+    let feed = traces.subscribe().unwrap();
+    let (subscriber, control) =
+        nddev_device_sync_telemetry::subscriber(config, Capture(output.clone()), traces.tracer())
+            .unwrap();
     tracing::subscriber::with_default(subscriber, || {
-        nddev_device_sync_telemetry::operation_span("accounts", "io")
+        let complete = |event, result: Result<(), ClientError>| {
+            io_span(event)
+                .unwrap()
+                .in_scope(|| report_io(event, &result, 1));
+        };
+        nddev_device_sync_telemetry::operation_span("vault", "process")
             .unwrap()
             .in_scope(|| {
                 for _ in 0..100 {
-                    report_io("identity.credential.read", &Ok(()), 1);
-                    report_io("identity.offline.fence.read", &Ok(()), 1);
+                    complete("identity.credential.read", Ok(()));
+                    complete("identity.offline.fence.read", Ok(()));
                 }
-                report_io("identity.credential.write", &Ok(()), 1);
-                report_io("identity.credential.delete", &Ok(()), 1);
-                report_io("identity.offline.fence", &Ok(()), 1);
-                report_io(
+                complete("identity.credential.write", Ok(()));
+                complete("identity.credential.delete", Ok(()));
+                complete("identity.offline.fence", Ok(()));
+                complete(
                     "identity.credential.read",
-                    &Err::<(), _>(ClientError::CredentialStore),
-                    1,
+                    Err(ClientError::CredentialStore),
                 );
-                report_io(
-                    "identity.offline.fence.read",
-                    &Err::<(), _>(ClientError::Busy),
-                    1,
-                );
+                complete("identity.offline.fence.read", Err(ClientError::Busy));
                 control
                     .set_debug(Some(DebugWindow {
                         scope: "io".into(),
@@ -67,16 +67,23 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
                         events: 2,
                     }))
                     .unwrap();
-                report_io("identity.credential.read", &Ok(()), 1);
-                report_io("identity.offline.fence.read", &Ok(()), 1);
-                report_io("identity.credential.read", &Ok(()), 1);
-                report_io(
-                    "identity.credential.read",
-                    &Err::<(), _>(ClientError::Timeout),
-                    1,
-                );
+                complete("identity.credential.read", Ok(()));
+                complete("identity.offline.fence.read", Ok(()));
+                complete("identity.credential.read", Ok(()));
+                complete("identity.credential.read", Err(ClientError::Timeout));
             });
+        let standalone = io_span("identity.credential.read").unwrap();
+        assert!(
+            nddev_device_sync_telemetry::trace_context(&standalone)
+                .span()
+                .span_context()
+                .is_valid()
+        );
     });
+    // The parent, three mutations and a standalone read retain real spans.
+    // Two hundred nested reads cannot exhaust the unchanged 128-span feed.
+    assert_eq!(feed.health().pending, 5);
+    assert_eq!(feed.health().dropped, 0);
     assert!(!control.debug_active());
     assert_eq!(control.rejected_fields_or_events(), 0);
     let events: Vec<serde_json::Value> = output

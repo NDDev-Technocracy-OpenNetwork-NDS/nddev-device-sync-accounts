@@ -84,7 +84,8 @@ keyring, offline restart and later pipeline acceptance remain separate gates.
 
 Successful credential and authorization-fence reads are bounded `io` debug
 diagnostics. Mutations, admission and every I/O failure remain normal-mode
-events; correlated operation spans remain available in both modes. Fence reads
+events. Nested reads reuse the caller's actual trace; standalone reads and
+mutations create operation spans. Fence reads
 use `identity.offline.fence.read`, distinct from the mutation audit event.
 
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
