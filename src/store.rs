@@ -26,7 +26,51 @@ const SERVICE: &str = "ai.nddev.nds.session.v2";
 // One platform call and at most seven waiting callers per endpoint. Waiting is
 // cancellable and shares the existing 15-second I/O deadline with execution.
 const MAX_IO_REQUESTS: usize = 8;
+const MAX_SIGNED_WAITERS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn diagnostic_read(event: &str) -> bool {
+    matches!(
+        event,
+        "identity.credential.read" | "identity.offline.fence.read"
+    )
+}
+
+fn io_span(event: &str) -> Result<tracing::Span, ClientError> {
+    use opentelemetry::trace::TraceContextExt;
+    let parent = tracing::Span::current();
+    // A useful operation must fit the bounded feed without exporting a span
+    // for every repeated key/fence lookup. Keep its actual parent correlation;
+    // standalone reads still create a trace. Delivery suppression is inherited.
+    if diagnostic_read(event)
+        && nddev_device_sync_telemetry::trace_context(&parent)
+            .span()
+            .span_context()
+            .is_valid()
+    {
+        return Ok(parent);
+    }
+    nddev_device_sync_telemetry::operation_span("accounts", "io")
+        .map_err(|_| ClientError::TelemetryUnavailable)
+}
+
+// Repeated reads are diagnostics; mutations and all failures remain normal-mode
+// audit events. Native and browser adapters use the same completion policy.
+fn report_io<T>(event: &'static str, result: &Result<T, ClientError>, duration_ms: u64) {
+    match result {
+        Ok(_) if diagnostic_read(event) => {
+            tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
+                event.name=event, module="accounts", scope="io", duration_ms, outcome="ok"
+            });
+        }
+        Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
+            event.name=event, module="accounts", scope="io", duration_ms, outcome="ok"
+        }),
+        Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+            event.name=event, module="accounts", scope="io", duration_ms, error.type=error.code(), outcome="error"
+        }),
+    }
+}
 
 struct IoPermit {
     _serial: OwnedSemaphorePermit,
@@ -45,6 +89,7 @@ struct SessionOwner {
     io: Arc<Semaphore>,
     io_requests: Arc<Semaphore>,
     operation: Arc<Semaphore>,
+    signed_waiters: Arc<Semaphore>,
     lease: Mutex<Weak<admission::Lease>>,
 }
 
@@ -69,6 +114,7 @@ impl SessionStore {
                 io: Arc::new(Semaphore::new(1)),
                 io_requests: Arc::new(Semaphore::new(MAX_IO_REQUESTS)),
                 operation: Arc::new(Semaphore::new(1)),
+                signed_waiters: Arc::new(Semaphore::new(MAX_SIGNED_WAITERS)),
                 lease: Mutex::default(),
             });
             owners.insert(key.clone(), Arc::downgrade(&owner));
@@ -131,11 +177,28 @@ impl SessionStore {
             .map_err(|_| ClientError::Busy)
     }
 
+    /// Signed module traffic shares the existing identity writer fairly. A
+    /// healthy exporter must not repeatedly win a try-lock and starve a replica
+    /// between its signed requests. Queue admission, waiting and cancellation
+    /// stay bounded; foreground identity mutations retain their busy contract.
+    pub(crate) async fn signed_operation(&self) -> Result<OwnedSemaphorePermit, ClientError> {
+        let _waiting = self
+            .owner
+            .signed_waiters
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ClientError::Busy)?;
+        crate::runtime::timeout(IO_TIMEOUT, self.owner.operation.clone().acquire_owned())
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::CredentialStore)
+    }
+
     async fn admit_io(&self, span: &tracing::Span) -> Result<(IoPermit, Duration), ClientError> {
         let started = crate::runtime::Instant::now();
         let rejected = |error: ClientError| {
             span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                event.name="identity.credential.admission_rejected", error.type=error.code(), outcome="rejected"
+                event.name="identity.credential.admission_rejected", module="accounts", scope="io", error.type=error.code(), outcome="rejected"
             }));
             error
         };
@@ -168,8 +231,7 @@ impl SessionStore {
         event: &'static str,
         action: impl FnOnce(&'static str, &str) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
-        let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
-            .map_err(|_| ClientError::TelemetryUnavailable)?;
+        let span = io_span(event)?;
         let (permit, remaining) = self.admit_io(&span).await?;
         let key = self.key.clone();
         let service = self.service;
@@ -186,27 +248,20 @@ impl SessionStore {
         let work = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
                 worker_span.in_scope(|| {
-            let _permit = permit;
-            let _owner = owner;
-            let _lease = lease;
-            let started = Instant::now();
+                    let _permit = permit;
+                    let _owner = owner;
+                    let _lease = lease;
+                    let started = Instant::now();
                     tracing::event!(target:"nds_accounts",tracing::Level::DEBUG, {
-                        event.name=event, outcome="started"
+                        event.name=event, module="accounts", scope="io", outcome="started"
                     });
-            let result = action(service, &key);
-            // This is the actual OS completion, including a late completion
-            // after the waiting caller timed out or was cancelled. No key,
-            // endpoint, value, presence flag or provider error text is emitted.
-            match &result {
-                Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, {
-                    event.name=event, duration_ms=started.elapsed().as_millis() as u64, outcome="ok"
-                }),
-                Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                    event.name=event, duration_ms=started.elapsed().as_millis() as u64, error.type=error.code(), outcome="error"
-                }),
-            }
-            result
-        })
+                    let result = action(service, &key);
+                    // This is the actual OS completion, including a late completion
+                    // after the waiting caller timed out or was cancelled. No key,
+                    // endpoint, value, presence flag or provider error text is emitted.
+                    report_io(event, &result, started.elapsed().as_millis() as u64);
+                    result
+                })
             })
         });
         match tokio::time::timeout(remaining, work).await {
@@ -218,7 +273,7 @@ impl SessionStore {
                     ClientError::CredentialStore
                 };
                 span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
-                    event.name="identity.credential.wait_failed", error.type=error.code(), outcome="error"
+                    event.name="identity.credential.wait_failed", module="accounts", scope="io", error.type=error.code(), outcome="error"
                 }));
                 Err(error)
             }

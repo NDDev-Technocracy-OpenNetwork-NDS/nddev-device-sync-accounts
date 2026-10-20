@@ -169,6 +169,24 @@ async fn actual_signed_client_delivery_and_incidents() {
         before.spans_delivered,
         "delivery generated its own span feedback"
     );
+    // The same writer is used by foreground replica calls and the exporter.
+    // Prove real signed HTTP waits instead of aborting a multi-request sync
+    // batch merely because another local operation owns its admission slot.
+    let active = identity.store.operation().unwrap();
+    let mut first = Box::pin(identity.sync_request(SyncRequest::CapabilitiesV3));
+    let mut second = Box::pin(identity.sync_request(SyncRequest::CapabilitiesV3));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(active);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("real signed requests did not acquire shared admission");
+    assert_eq!(first.unwrap().status, 200);
+    assert_eq!(second.unwrap().status, 200);
+    let before = delivery.flush().await;
+    assert_eq!(before.pending + before.spans_pending, 0);
     let page: wire::IncidentPage = serde_json::from_slice(
         &identity
             .sync_request(SyncRequest::Incidents {
@@ -212,7 +230,38 @@ async fn actual_signed_client_delivery_and_incidents() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(delivery.snapshot().paused && delivery.snapshot().pending > 0);
     assert_eq!(delivery.snapshot().delivered, before.delivered);
+    fixture_mode(&receipt, &fixture, "offline").await;
     delivery.foreground(true);
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while delivery.snapshot().failures == before.failures {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a real server disconnect did not degrade delivery");
+    assert!(delivery.snapshot().pending > 0);
+    assert_eq!(delivery.snapshot().delivered, before.delivered);
+    fixture_mode(&receipt, &fixture, "online").await;
+    // A transport failure revokes online authority. The application owns its
+    // existing authorization reconciliation; the exporter must not bypass it
+    // or become a second identity owner just to retry telemetry.
+    assert!(!identity.authority_online());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !identity.authority_online() {
+            identity.maintain_authorization().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("ordinary signed authority reconciliation did not recover");
+    assert_eq!(identity.view().current_device_id, view.current_device_id);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while delivery.snapshot().pending + delivery.snapshot().spans_pending > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("retained telemetry did not drain after the real server restarted");
     let after = delivery.flush().await;
     assert_eq!(after.pending + after.spans_pending, 0);
     assert_eq!(after.dropped + after.spans_dropped, 0);
@@ -251,6 +300,23 @@ async fn actual_signed_client_delivery_and_incidents() {
     assert!(origin.starts_with("http://127.0.0.1:"));
     let user = query["user"].as_str().unwrap();
     let password = query["password"].as_str().unwrap();
+    let searchable_logs = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+            let body = json!({"query":{"sql":format!("SELECT * FROM nds WHERE trace_id='{trace_id}' AND event_name='client.failure'"),"start_time":now-3_600_000_000u64,"end_time":now+2_000_000,"from":0,"size":20}});
+            let result: Value = http.post(format!("{origin}/api/default/_search?type=logs")).basic_auth(user, Some(password)).json(&body).send().await.unwrap().json().await.unwrap();
+            if let Some(hits) = result["hits"].as_array().filter(|hits| !hits.is_empty()) {
+                assert_eq!(hits.len(), 1, "the actual event was indexed more than once");
+                let event = &hits[0];
+                assert_eq!(event["device_id"], view.current_device_id);
+                assert_eq!(event["user_id"], view.user_id);
+                assert_eq!(event["tenant_id"], view.tenant_id);
+                assert_eq!(event["error_type"], "flutter_framework_error");
+                break hits.len();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.expect("gateway ACK did not become a searchable, authenticated log");
     let streams: Value = http
         .get(format!("{origin}/api/default/streams?type=traces"))
         .basic_auth(user, Some(password))
@@ -291,8 +357,35 @@ async fn actual_signed_client_delivery_and_incidents() {
         .delete()
         .await
         .unwrap();
-    std::fs::write(receipt.with_file_name("client-delivery-result.json"), json!({"trace_id":trace_id,"delivered_events":after.delivered,"delivered_spans":after.spans_delivered,"dropped":after.dropped+after.spans_dropped,"signed_gateway":"passed","incident_ack_replay_resolution":"passed","background_resume":"passed","feedback":"absent","searchable_native_spans":native_count}).to_string()).unwrap();
+    std::fs::write(receipt.with_file_name("client-delivery-result.json"), json!({"trace_id":trace_id,"delivered_events":after.delivered,"delivered_spans":after.spans_delivered,"dropped":after.dropped+after.spans_dropped,"signed_gateway":"passed","incident_ack_replay_resolution":"passed","background_resume":"passed","actual_server_disconnect_reconnect":"passed","observed_delivery_failures":after.failures-before.failures,"feedback":"absent","searchable_logs":searchable_logs,"searchable_native_spans":native_count}).to_string()).unwrap();
     traces.shutdown();
     logger.shutdown();
+}
+
+async fn fixture_mode(receipt: &std::path::Path, fixture: &Value, mode: &str) {
+    let control = std::path::Path::new(fixture["control_file"].as_str().unwrap());
+    std::fs::write(control, serde_json::to_vec(&json!({"mode":mode})).unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let current = std::fs::read(receipt)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            if !control.exists()
+                && current.is_some_and(|v| {
+                    v["status"]
+                        == if mode == "offline" {
+                            "offline"
+                        } else {
+                            "running"
+                        }
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the owned server fixture did not change its actual process state");
 }
 use std::time::{SystemTime, UNIX_EPOCH};

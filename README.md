@@ -82,6 +82,19 @@ clock against a compromised OS or browser profile.
 `just wasm-check` compiles the browser adapter. Actual browser cookie, native
 keyring, offline restart and later pipeline acceptance remain separate gates.
 
+Successful credential and authorization-fence reads are bounded `io` debug
+diagnostics. Mutations, admission and every I/O failure remain normal-mode
+events. Nested reads reuse the caller's actual trace; standalone reads and
+mutations create operation spans. Fence reads
+use `identity.offline.fence.read`, distinct from the mutation audit event.
+
+Signed module requests share the existing identity writer through FIFO admission:
+at most eight waiting requests and a 15-second admission deadline. Cancelling
+a waiting future releases its slot. The original local-use lifetime is checked
+again before signing and before publishing a successful response; waiting cannot
+retarget a command after logout or cancellation. Ordinary sign-in/account
+mutations keep their existing immediate busy result.
+
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
 agent consumers. The SDK owns redaction and record lifetimes; the sender checks
 the narrow `/v2/observability/client-policy` export policy, pauses in the background and uses bounded backoff with
@@ -112,9 +125,11 @@ health, so partial acceptance does not claim a new full-success timestamp.
 The ignored `actual_signed_client_delivery_and_incidents` test requires owned
 server and observability fixture receipts through `NDS_FIXTURE_RECEIPT` and
 `NDS_OBSERVABILITY_FIXTURE_RECEIPT`. It exercises real native credentials, signed
-HTTP, PostgreSQL, Vector and searchable OpenObserve spans, incident replay and
-resolution, background/resume and absence of recursive export. Fixture credentials
-and generated identities remain outside public source.
+HTTP, PostgreSQL, Vector and searchable OpenObserve spans and logs, incident
+replay and resolution, background/resume, a real server disconnect
+and restart, and absence of recursive export. Reconnection uses the application's
+existing authorization reconciliation; the exporter cannot bypass that owner.
+Fixture credentials and generated identities remain outside public source.
 
 Owners can list passkey fingerprints/registration times and remove a credential
 through the native client. Removal requires a fresh server-verified session and
