@@ -3,6 +3,120 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
+    use nddev_device_sync_telemetry::client_traces::ClientTraces;
+    use nddev_device_sync_telemetry::{Config, DebugWindow};
+    use opentelemetry::trace::TraceContextExt;
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut output = self.0.lock().unwrap();
+            assert!(output.len() + bytes.len() <= 65_536);
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let config = Config {
+        service: "nds-store-policy-acceptance".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts".into(),
+        commit: "unknown".into(),
+        channel: "alpha".into(),
+        standards: "unreleased".into(),
+        environment: "test".into(),
+        target_prefixes: vec!["nds_accounts".into()],
+        default_module: "accounts".into(),
+        debug: None,
+    };
+    let traces = ClientTraces::new(&config).unwrap();
+    let feed = traces.subscribe().unwrap();
+    let (subscriber, control) =
+        nddev_device_sync_telemetry::subscriber(config, Capture(output.clone()), traces.tracer())
+            .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        let complete = |event, result: Result<(), ClientError>| {
+            io_span(event)
+                .unwrap()
+                .in_scope(|| report_io(event, &result, 1));
+        };
+        nddev_device_sync_telemetry::operation_span("vault", "process")
+            .unwrap()
+            .in_scope(|| {
+                for _ in 0..100 {
+                    complete("identity.credential.read", Ok(()));
+                    complete("identity.offline.fence.read", Ok(()));
+                }
+                complete("identity.credential.write", Ok(()));
+                complete("identity.credential.delete", Ok(()));
+                complete("identity.offline.fence", Ok(()));
+                complete(
+                    "identity.credential.read",
+                    Err(ClientError::CredentialStore),
+                );
+                complete("identity.offline.fence.read", Err(ClientError::Busy));
+                control
+                    .set_debug(Some(DebugWindow {
+                        scope: "io".into(),
+                        duration: Duration::from_secs(30),
+                        events: 2,
+                    }))
+                    .unwrap();
+                complete("identity.credential.read", Ok(()));
+                complete("identity.offline.fence.read", Ok(()));
+                complete("identity.credential.read", Ok(()));
+                complete("identity.credential.read", Err(ClientError::Timeout));
+            });
+        let standalone = io_span("identity.credential.read").unwrap();
+        assert!(
+            nddev_device_sync_telemetry::trace_context(&standalone)
+                .span()
+                .span_context()
+                .is_valid()
+        );
+    });
+    // The parent, three mutations and a standalone read retain real spans.
+    // Two hundred nested reads cannot exhaust the unchanged 128-span feed.
+    assert_eq!(feed.health().pending, 5);
+    assert_eq!(feed.health().dropped, 0);
+    assert!(!control.debug_active());
+    assert_eq!(control.rejected_fields_or_events(), 0);
+    let events: Vec<serde_json::Value> = output
+        .lock()
+        .unwrap()
+        .split(|b| *b == b'\n')
+        .filter(|b| !b.is_empty())
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+            nddev_device_sync_telemetry::decode_event(event.clone()).unwrap();
+            event
+        })
+        .collect();
+    let identities: Vec<_> = events
+        .iter()
+        .filter(|e| e["event.name"].as_str().unwrap().starts_with("identity."))
+        .collect();
+    assert_eq!(identities.len(), 8);
+    for (event, severity) in identities.iter().zip([
+        "info", "info", "info", "warn", "warn", "debug", "debug", "warn",
+    ]) {
+        assert_eq!(event["severity"], severity);
+        assert_eq!(event["module"], "accounts");
+        assert_eq!(event["scope"], "io");
+        assert!(event["trace_id"].as_str().is_some_and(|id| id.len() == 32));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event.name"] == "logging.debug.disabled")
+    );
+}
+
 #[tokio::test]
 async fn cancelled_caller_keeps_running_work_owned_and_waiters_can_cancel() {
     let store =

@@ -37,8 +37,7 @@ impl SessionStore {
         event: &'static str,
         operation: impl std::future::Future<Output = Result<T, ClientError>> + 'static,
     ) -> Result<T, ClientError> {
-        let span = nddev_device_sync_telemetry::operation_span("accounts", "io")
-            .map_err(|_| ClientError::TelemetryUnavailable)?;
+        let span = io_span(event)?;
         let (permit, remaining) = self.admit_io(&span).await?;
         let owner = self.owner.clone();
         let lease = owner
@@ -50,18 +49,18 @@ impl SessionStore {
         // As with the native OS adapter, cancellation of the waiting caller
         // cannot release admission while an uninterruptible credential write
         // still owns its transaction. A late completion remains observable.
-        wasm_bindgen_futures::spawn_local(async move {
-            let _permit = permit;
-            let _owner = owner;
-            let _lease = lease;
-            let started = web_time::Instant::now();
-            let result = operation.await;
-            match &result {
-                Ok(_) => tracing::event!(target:"nds_accounts",tracing::Level::INFO, { event.name=event, duration_ms=started.elapsed().as_millis() as u64, outcome="ok"}),
-                Err(error) => tracing::event!(target:"nds_accounts",tracing::Level::WARN, { event.name=event, duration_ms=started.elapsed().as_millis() as u64, error.type=error.code(), outcome="error"}),
+        wasm_bindgen_futures::spawn_local(
+            async move {
+                let _permit = permit;
+                let _owner = owner;
+                let _lease = lease;
+                let started = web_time::Instant::now();
+                let result = operation.await;
+                report_io(event, &result, started.elapsed().as_millis() as u64);
+                let _ = sender.send(result);
             }
-            let _ = sender.send(result);
-        }.instrument(span.clone()));
+            .instrument(span.clone()),
+        );
         match futures::future::select(
             receiver.boxed_local(),
             gloo_timers::future::TimeoutFuture::new(remaining.as_millis() as u32).boxed_local(),
@@ -71,7 +70,7 @@ impl SessionStore {
             Either::Left((Ok(value), _)) => value,
             Either::Left((Err(_), _)) => Err(ClientError::CredentialStore),
             Either::Right(_) => {
-                span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, { event.name="identity.credential.wait_failed", error.type="request_timeout", outcome="error"}));
+                span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, { event.name="identity.credential.wait_failed", module="accounts", scope="io", error.type="request_timeout", outcome="error"}));
                 Err(ClientError::Timeout)
             }
         }
