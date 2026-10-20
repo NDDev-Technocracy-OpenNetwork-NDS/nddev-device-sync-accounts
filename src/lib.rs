@@ -193,6 +193,13 @@ impl IdentityClient {
 
     async fn operation(&self) -> Result<(OperationPermit, CancellationToken), ClientError> {
         let permit = self.store.operation()?;
+        self.activate_operation(permit).await
+    }
+
+    async fn activate_operation(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(OperationPermit, CancellationToken), ClientError> {
         let token = CancellationToken::new();
         *self.cancellation.lock().unwrap_or_else(|e| e.into_inner()) = token.clone();
         let permit = tokio::select! {

@@ -392,8 +392,14 @@ impl IdentityClient {
         }
     }
     async fn signed_request(&self, request: SyncRequest) -> Result<SyncReply, ClientError> {
-        let (_permit, cancel) = self.operation().await?;
-        self.signed_request_inner(request, &cancel).await
+        let lifetime = self.local_use_lifetime();
+        let permit = self.store.signed_operation().await?;
+        self.check_captured_local_use_lifetime(&lifetime)?;
+        let (_permit, cancel) = self.activate_operation(permit).await?;
+        self.check_captured_local_use_lifetime(&lifetime)?;
+        let reply = self.signed_request_inner(request, &cancel).await?;
+        self.check_captured_local_use_lifetime(&lifetime)?;
+        Ok(reply)
     }
 
     pub(crate) async fn signed_request_inner(
