@@ -88,6 +88,13 @@ events. Nested reads reuse the caller's actual trace; standalone reads and
 mutations create operation spans. Fence reads
 use `identity.offline.fence.read`, distinct from the mutation audit event.
 
+Signed module requests share the existing identity writer through FIFO admission:
+at most eight waiting requests and a 15-second admission deadline. Cancelling
+a waiting future releases its slot. The original local-use lifetime is checked
+again before signing and before publishing a successful response; waiting cannot
+retarget a command after logout or cancellation. Ordinary sign-in/account
+mutations keep their existing immediate busy result.
+
 `telemetry::Delivery` owns signed event/native OTLP delivery for the desktop and
 agent consumers. The SDK owns redaction and record lifetimes; the sender checks
 the narrow `/v2/observability/client-policy` export policy, pauses in the background and uses bounded backoff with

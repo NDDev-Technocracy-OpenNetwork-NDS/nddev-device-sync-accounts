@@ -169,6 +169,24 @@ async fn actual_signed_client_delivery_and_incidents() {
         before.spans_delivered,
         "delivery generated its own span feedback"
     );
+    // The same writer is used by foreground replica calls and the exporter.
+    // Prove real signed HTTP waits instead of aborting a multi-request sync
+    // batch merely because another local operation owns its admission slot.
+    let active = identity.store.operation().unwrap();
+    let mut first = Box::pin(identity.sync_request(SyncRequest::CapabilitiesV3));
+    let mut second = Box::pin(identity.sync_request(SyncRequest::CapabilitiesV3));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(active);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("real signed requests did not acquire shared admission");
+    assert_eq!(first.unwrap().status, 200);
+    assert_eq!(second.unwrap().status, 200);
+    let before = delivery.flush().await;
+    assert_eq!(before.pending + before.spans_pending, 0);
     let page: wire::IncidentPage = serde_json::from_slice(
         &identity
             .sync_request(SyncRequest::Incidents {

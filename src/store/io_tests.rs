@@ -118,6 +118,57 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
 }
 
 #[tokio::test]
+async fn signed_requests_wait_fairly_and_cancelled_waiters_release_capacity() {
+    let store = SessionStore::for_endpoint(&format!(
+        "https://nds-signed-{}.invalid/",
+        uuid::Uuid::new_v4()
+    ))
+    .unwrap();
+    let active = store.operation().unwrap();
+    let mut waiting = Vec::new();
+    for _ in 0..MAX_SIGNED_WAITERS {
+        let mut future = Box::pin(store.signed_operation());
+        assert!(futures::poll!(future.as_mut()).is_pending());
+        waiting.push(future);
+    }
+    assert!(matches!(
+        store.signed_operation().await,
+        Err(ClientError::Busy)
+    ));
+    waiting.pop();
+    let mut replacement = Box::pin(store.signed_operation());
+    assert!(futures::poll!(replacement.as_mut()).is_pending());
+    drop(active);
+    let first = waiting.remove(0).await.unwrap();
+    assert!(futures::poll!(replacement.as_mut()).is_pending());
+    assert!(matches!(store.operation(), Err(ClientError::Busy)));
+    drop(first);
+    for future in waiting {
+        drop(future.await.unwrap());
+    }
+    drop(replacement.await.unwrap());
+    drop(store.operation().unwrap());
+}
+
+#[tokio::test]
+async fn queued_signed_request_cannot_retarget_after_client_cancellation() {
+    let client = crate::IdentityClient::new(&format!(
+        "https://nds-queued-{}.invalid/",
+        uuid::Uuid::new_v4()
+    ))
+    .unwrap();
+    let active = client.store.operation().unwrap();
+    let mut request = Box::pin(client.sync_request(crate::SyncRequest::TelemetryPolicy));
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    client.cancel();
+    drop(active);
+    assert!(matches!(
+        request.await,
+        Err(ClientError::RevalidationRequired)
+    ));
+}
+
+#[tokio::test]
 async fn cancelled_caller_keeps_running_work_owned_and_waiters_can_cancel() {
     let store =
         SessionStore::for_endpoint(&format!("https://nds-io-{}.invalid/", uuid::Uuid::new_v4()))

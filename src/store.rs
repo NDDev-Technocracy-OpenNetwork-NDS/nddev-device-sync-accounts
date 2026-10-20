@@ -26,6 +26,7 @@ const SERVICE: &str = "ai.nddev.nds.session.v2";
 // One platform call and at most seven waiting callers per endpoint. Waiting is
 // cancellable and shares the existing 15-second I/O deadline with execution.
 const MAX_IO_REQUESTS: usize = 8;
+const MAX_SIGNED_WAITERS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn diagnostic_read(event: &str) -> bool {
@@ -88,6 +89,7 @@ struct SessionOwner {
     io: Arc<Semaphore>,
     io_requests: Arc<Semaphore>,
     operation: Arc<Semaphore>,
+    signed_waiters: Arc<Semaphore>,
     lease: Mutex<Weak<admission::Lease>>,
 }
 
@@ -112,6 +114,7 @@ impl SessionStore {
                 io: Arc::new(Semaphore::new(1)),
                 io_requests: Arc::new(Semaphore::new(MAX_IO_REQUESTS)),
                 operation: Arc::new(Semaphore::new(1)),
+                signed_waiters: Arc::new(Semaphore::new(MAX_SIGNED_WAITERS)),
                 lease: Mutex::default(),
             });
             owners.insert(key.clone(), Arc::downgrade(&owner));
@@ -172,6 +175,23 @@ impl SessionStore {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ClientError::Busy)
+    }
+
+    /// Signed module traffic shares the existing identity writer fairly. A
+    /// healthy exporter must not repeatedly win a try-lock and starve a replica
+    /// between its signed requests. Queue admission, waiting and cancellation
+    /// stay bounded; foreground identity mutations retain their busy contract.
+    pub(crate) async fn signed_operation(&self) -> Result<OwnedSemaphorePermit, ClientError> {
+        let _waiting = self
+            .owner
+            .signed_waiters
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ClientError::Busy)?;
+        crate::runtime::timeout(IO_TIMEOUT, self.owner.operation.clone().acquire_owned())
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::CredentialStore)
     }
 
     async fn admit_io(&self, span: &tracing::Span) -> Result<(IoPermit, Duration), ClientError> {
