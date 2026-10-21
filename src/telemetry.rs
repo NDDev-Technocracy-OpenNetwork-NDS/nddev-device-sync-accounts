@@ -121,6 +121,12 @@ fn terminal(error: &ClientError) -> bool {
         ClientError::DeviceRevoked | ClientError::RevalidationRequired | ClientError::Cancelled
     ) || matches!(error, ClientError::Server(code) if code == "authentication_failed" || code == "device_revoked")
 }
+fn admission_delayed(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Busy | ClientError::OnlineVerificationRequired
+    ) || matches!(error, ClientError::Server(code) if code == "server_busy")
+}
 async fn run(
     identity: Arc<IdentityClient>,
     source: Arc<Source>,
@@ -237,7 +243,7 @@ async fn run(
                     checked = Some(Instant::now());
                 }
                 Err(error) if terminal(&error) => break,
-                Err(ClientError::Busy | ClientError::OnlineVerificationRequired) => {
+                Err(error) if admission_delayed(&error) => {
                     delay = Duration::from_secs(1);
                     continue;
                 }
@@ -312,7 +318,7 @@ async fn run(
                 delay = Duration::ZERO;
             }
             Err(error) if terminal(&error) => break,
-            Err(ClientError::Busy | ClientError::OnlineVerificationRequired) => {
+            Err(error) if admission_delayed(&error) => {
                 Batch::park(&mut pending);
                 delay = Duration::from_secs(1);
             }
