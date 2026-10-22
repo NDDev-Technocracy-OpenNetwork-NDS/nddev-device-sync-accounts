@@ -72,6 +72,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.15.0'
+      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
       - id: protocol
         run: |
           python - <<'PY'
@@ -91,3 +92,4 @@ jobs:
       - run: python scripts/generate.py --check
         env:
           NDS_PROTOCOL_SOURCE: ${{ github.workspace }}/vendor/protocol
+          RUSTUP_TOOLCHAIN: '1.99.1'
