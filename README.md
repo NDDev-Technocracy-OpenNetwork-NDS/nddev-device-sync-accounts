@@ -183,3 +183,5 @@ sends it in the generated request body. It never selects the first/bootstrap
 member locally. An omitted selector is resolved only by the server's existing
 unambiguous-account rule. Registration rejects a selector and remains bound to
 the current authenticated session; selectors are never credential proof or logs.
+
+Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts/releases).

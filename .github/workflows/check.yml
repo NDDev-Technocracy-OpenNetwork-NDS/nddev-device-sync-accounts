@@ -1,87 +1,42 @@
 name: NDS checks
+
 on:
   pull_request:
-    branches: [dev, main]
-  push:
-    branches: [dev, main]
+    branches: [main, dev]
   workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-env:
-  CARGO_BUILD_JOBS: 4
+
 jobs:
-  rust:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-features
-  contracts:
+  quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version-file: package.json
-      - name: Strict browser I/O and generated adapter drift
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+      - name: Install pinned quality tools
         run: |
-          bun install --frozen-lockfile --ignore-scripts
-          bun run check
-          bun run check:generated
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.15.0'
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: '24.22.0'
-      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
-      - run: cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
-      - id: protocol
-        run: |
-          python - <<'PY'
-          import os,re,tomllib
-          from pathlib import Path
-          lock=tomllib.loads(Path('protocol.lock').read_text())
-          assert lock['source_repo']=='NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol'
-          assert re.fullmatch('[a-f0-9]{40}',lock['source_commit'])
-          with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('sha='+lock['source_commit']+'\n')
-          PY
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol
-          ref: ${{ steps.protocol.outputs.sha }}
-          path: vendor/protocol
-          persist-credentials: false
-      - run: python scripts/generate.py --check
+          cargo install --locked --version 0.9.148 cargo-nextest
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo install --locked --version 0.20.2 cargo-deny
+      - name: Run the STD-0004 native Rust contract
+        id: native
+        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/ci@a77e385fcf3c1b000c38167ecac7b74bb7715b10 # std-0004-v0.3.1
+      - name: Require complete native results
+        if: ${{ !cancelled() }}
         env:
-          NDS_PROTOCOL_SOURCE: ${{ github.workspace }}/vendor/protocol
-      - run: cargo install --locked --version 0.9.148 cargo-nextest
-      - run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
-      - run: cargo nextest run --locked --all-features
-      - run: cargo install --locked --version 0.22.2 cargo-audit
-      - run: cargo install --locked --version 0.20.2 cargo-deny
-      - run: cargo audit --deny warnings
-      - run: cargo deny --locked check licenses sources
-  quality:
-    if: always()
-    needs: [rust, contracts]
-    runs-on: ubuntu-24.04
-    steps:
-      - run: test '${{ needs.rust.result }}' = success && test '${{ needs.contracts.result }}' = success
+          STATUS: ${{ steps.native.outputs.status }}
+        run: test "$STATUS" = success

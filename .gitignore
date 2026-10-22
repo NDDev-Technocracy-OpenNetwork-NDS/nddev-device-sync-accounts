@@ -3,3 +3,4 @@ __pycache__/
 
 /vendor/
 /node_modules/
+.nddev-reports/

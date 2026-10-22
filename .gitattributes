@@ -1,2 +1,7 @@
+* text=auto eol=lf
+
+.nds/generated.json linguist-generated
+CLAUDE.md linguist-generated
+
 src/browser_credentials.js linguist-generated=true
 src/browser_http.js linguist-generated=true
