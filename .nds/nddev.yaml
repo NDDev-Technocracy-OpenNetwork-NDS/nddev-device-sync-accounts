@@ -1,0 +1,59 @@
+# std-0001 repository manifest — schema: `nddev schema manifest`.
+apiVersion: nddev.ai/v1alpha3
+kind: Repository
+metadata:
+  id: nddev-device-sync-accounts
+  locator: github:NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts
+  owner: rldyourmnd
+spec:
+  standard:
+    id: std-0001
+    version: 3.0.0
+  role: component
+  profiles:
+  - rust
+  - typescript
+  system:
+    id: nds
+    root: github:NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync
+  portfolios:
+  - portfolio:nddev-opennetwork
+  provides:
+  - name: accounts
+    source: src/lib.rs
+    direction: code-first
+  consumes:
+  - contract: nddev-device-sync-protocol/protocol
+    via: Cargo.toml
+  - contract: nddev-device-sync-core/domain
+    via: Cargo.toml
+  variations:
+  - paths: [.gds]
+    purpose: config
+    reason: GDS-owned repository anchor and policy projections; std-0001 excludes .gds by its own boundary rule.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [module.yaml, tsconfig.base.json]
+    purpose: manifest
+    reason: NDS module descriptor and shared TypeScript project references owned by the product standards corpus.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [standarts.lock, protocol.lock]
+    purpose: lock
+    reason: NDS contract locks pinning the standards and protocol sources.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [scripts]
+    purpose: tool-config
+    reason: Native wire-projection generator owned by the repository.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [examples]
+    purpose: example
+    reason: Runnable consumer examples owned by the repository.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  - paths: [.config]
+    purpose: tool-config
+    reason: Pinned nextest CI profile configuration owned by the repository.
+    decision: {state: approved, by: rldyourmnd, date: "2026-10-22", origin: document, reference: standarts/decisions/0013-estate-hygiene-and-standards-adoption.md}
+  modules:
+  - .
+  adapters:
+  - claude
+  - cursor
