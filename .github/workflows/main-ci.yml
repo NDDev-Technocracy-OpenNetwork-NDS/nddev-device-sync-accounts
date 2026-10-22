@@ -43,6 +43,8 @@ jobs:
         env:
           STATUS: ${{ steps.native.outputs.status }}
         run: test "$STATUS" = success
+      - name: Run the RustSec advisory audit
+        run: cargo audit --deny warnings
 
   matrix:
     strategy:
