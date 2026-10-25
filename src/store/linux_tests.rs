@@ -112,6 +112,74 @@ async fn repeated_reads_do_not_accumulate_unserviced_callbacks() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires an isolated unlocked Secret Service and a fresh resource-measurement process"]
+async fn repeated_reads_keep_native_schema_memory_bounded() {
+    assert_eq!(std::env::var("NDS_ISOLATED_PROVIDER").as_deref(), Ok("1"));
+    const CHILD: &str = "NDS_NATIVE_SCHEMA_MEMORY_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "repeated_reads_keep_native_schema_memory_bounded",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "Native schema resource child failed");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Native schema resource child exceeded its deadline");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    fn resident_kib() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let scope = format!(
+        "https://nds-native-schema-{}.invalid/",
+        uuid::Uuid::new_v4()
+    );
+    let store = SessionStore::for_endpoint(&scope).unwrap();
+    let value = vec![0xab; 8192];
+    store.write(&value).await.unwrap();
+    for _ in 0..256 {
+        assert!(store.read().await.unwrap().unwrap().as_slice() == value.as_slice());
+    }
+    let before = resident_kib();
+    for _ in 0..16_384 {
+        assert!(store.read().await.unwrap().unwrap().as_slice() == value.as_slice());
+    }
+    let after = resident_kib();
+    store.delete().await.unwrap();
+    assert!(store.read().await.unwrap().is_none());
+    eprintln!("Native schema RSS before={before} KiB, after={after} KiB");
+    // Fresh child and warm-up exclude earlier tests' native allocation peaks.
+    // Leave room for allocator variation, but reject a per-read metadata leak.
+    assert!(
+        after.saturating_sub(before) <= 3 * 1024,
+        "Native schema memory grew with completed reads"
+    );
+}
+
 struct OwnedItems(Vec<Item>);
 impl Drop for OwnedItems {
     fn drop(&mut self) {
