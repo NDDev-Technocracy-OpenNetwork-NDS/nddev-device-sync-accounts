@@ -233,6 +233,7 @@ impl SessionStore {
     ) -> Result<T, ClientError> {
         let span = io_span(event)?;
         let (permit, remaining) = self.admit_io(&span).await?;
+        let deadline = Instant::now() + remaining;
         let key = self.key.clone();
         let service = self.service;
         let owner = self.owner.clone();
@@ -245,7 +246,7 @@ impl SessionStore {
         let worker_span = span.clone();
         // The permit stays with the OS call even if its caller times out. Another
         // call cannot create an unbounded queue of non-preemptible native work.
-        let work = tokio::task::spawn_blocking(move || {
+        let action = move || {
             tracing::dispatcher::with_default(&dispatch, || {
                 worker_span.in_scope(|| {
                     let _permit = permit;
@@ -263,8 +264,16 @@ impl SessionStore {
                     result
                 })
             })
-        });
-        match tokio::time::timeout(remaining, work).await {
+        };
+        #[cfg(target_os = "linux")]
+        let work = linux::spawn(action, deadline).inspect_err(|error| {
+            span.in_scope(|| tracing::event!(target:"nds_accounts",tracing::Level::WARN, {
+                event.name="identity.credential.admission_rejected", module="accounts", scope="io", error.type=error.code(), outcome="rejected"
+            }));
+        })?;
+        #[cfg(not(target_os = "linux"))]
+        let work = tokio::task::spawn_blocking(action);
+        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), work).await {
             Ok(Ok(result)) => result,
             failed => {
                 let error = if failed.is_err() {

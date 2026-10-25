@@ -4,6 +4,14 @@ use glib::translate::*;
 use libsecret::{Item, Schema, Service, Value, prelude::*};
 use std::{collections::HashMap, ptr};
 use zeroize::Zeroizing;
+mod dispatch;
+pub(super) use dispatch::spawn;
+
+thread_local! {
+    // This proxy belongs to the native context, independently of other users
+    // of libsecret's process-global default proxy.
+    static SERVICE: std::cell::RefCell<Option<Service>> = const { std::cell::RefCell::new(None) };
+}
 
 pub(super) fn with_entry<T>(
     service: &str,
@@ -14,7 +22,7 @@ pub(super) fn with_entry<T>(
     if result.is_err() {
         // Discard the native library's cached proxy, not credential values.
         // Existing users retain their references. Never replay an uncertain write.
-        Service::disconnect();
+        SERVICE.with_borrow_mut(|service| *service = None);
     }
     result
 }
@@ -27,11 +35,21 @@ pub(super) struct Entry {
 
 impl Entry {
     fn new(service: &str, key: &str) -> Result<Self, ClientError> {
-        let native = Service::sync(
-            libsecret::ServiceFlags::OPEN_SESSION,
-            gio::Cancellable::NONE,
-        )
-        .map_err(|_| ClientError::CredentialStore)?;
+        let native = SERVICE.with_borrow_mut(|cached| {
+            if let Some(service) = cached {
+                return Ok(service.clone());
+            }
+            use glib::prelude::StaticType;
+            let service = Service::open_sync(
+                Service::static_type(),
+                None,
+                libsecret::ServiceFlags::OPEN_SESSION,
+                gio::Cancellable::NONE,
+            )
+            .map_err(|_| ClientError::CredentialStore)?;
+            *cached = Some(service.clone());
+            Ok(service)
+        })?;
         // libsecret can negotiate plain transport with a limited provider. NDS
         // requires encryption and rejects that fallback before accessing secrets.
         if native.session_algorithms().as_deref() != Some("dh-ietf1024-sha256-aes128-cbc-pkcs7") {
