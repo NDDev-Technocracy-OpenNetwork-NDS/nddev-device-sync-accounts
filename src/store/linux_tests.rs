@@ -1,7 +1,11 @@
 //! Real Secret Service acceptance; every test owns a fresh credential namespace.
 use super::*;
 use crate::SessionStore;
-use glib::prelude::StaticType;
+use glib::prelude::{ObjectExt, StaticType};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn independent(service: &str, key: &str) -> Entry {
     let mut entry = Entry::new(service, key).unwrap();
@@ -40,6 +44,57 @@ async fn fresh_reads_observe_external_binary_updates_and_deletion() {
             .await
             .unwrap()?;
         assert!(store.read().await?.is_none());
+        Ok::<_, ClientError>(())
+    }
+    .await;
+    store.delete().await.unwrap();
+    outcome.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated unlocked Secret Service without an application main loop"]
+async fn repeated_reads_release_native_item_proxies() {
+    assert_eq!(std::env::var("NDS_ISOLATED_PROVIDER").as_deref(), Ok("1"));
+    let scope = format!(
+        "https://nds-native-lifetime-{}.invalid/",
+        uuid::Uuid::new_v4()
+    );
+    let store = SessionStore::for_endpoint(&scope).unwrap();
+    store.write(b"owned-lifetime-fixture").await.unwrap();
+    let outcome = async {
+        let mut items = Vec::new();
+        for _ in 0..128 {
+            items.push(
+                store
+                    .run_io("identity.credential.read", |service, key| {
+                        with_entry(service, key, |entry| {
+                            let item = entry.find()?.ok_or(ClientError::CredentialStore)?;
+                            item.load_secret_sync(gio::Cancellable::NONE)
+                                .map_err(|_| ClientError::CredentialStore)?;
+                            let value = item.secret().ok_or(ClientError::CredentialStore)?;
+                            assert_eq!(value.get(), b"owned-lifetime-fixture");
+                            let released = Arc::new(AtomicBool::new(false));
+                            let notification = released.clone();
+                            let _ = item.add_weak_ref_notify(move || {
+                                notification.store(true, Ordering::Release);
+                            });
+                            Ok(released)
+                        })
+                    })
+                    .await?,
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while items
+            .iter()
+            .any(|released| !released.load(Ordering::Acquire))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Completed native reads retained item proxies without an application main loop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         Ok::<_, ClientError>(())
     }
     .await;
