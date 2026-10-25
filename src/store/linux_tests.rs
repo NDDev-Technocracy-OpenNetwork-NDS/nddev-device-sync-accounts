@@ -1,11 +1,7 @@
 //! Real Secret Service acceptance; every test owns a fresh credential namespace.
 use super::*;
 use crate::SessionStore;
-use glib::prelude::{ObjectExt, StaticType};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use glib::prelude::StaticType;
 
 fn independent(service: &str, key: &str) -> Entry {
     let mut entry = Entry::new(service, key).unwrap();
@@ -53,7 +49,7 @@ async fn fresh_reads_observe_external_binary_updates_and_deletion() {
 
 #[tokio::test]
 #[ignore = "requires an isolated unlocked Secret Service without an application main loop"]
-async fn repeated_reads_release_native_item_proxies() {
+async fn repeated_reads_do_not_accumulate_unserviced_callbacks() {
     assert_eq!(std::env::var("NDS_ISOLATED_PROVIDER").as_deref(), Ok("1"));
     let scope = format!(
         "https://nds-native-lifetime-{}.invalid/",
@@ -61,45 +57,47 @@ async fn repeated_reads_release_native_item_proxies() {
     );
     let store = SessionStore::for_endpoint(&scope).unwrap();
     store.write(b"owned-lifetime-fixture").await.unwrap();
+    let context = glib::MainContext::default();
+    let marker = || {
+        let source = glib::source::idle_source_new(
+            Some("owned-credential-lifetime-marker"),
+            glib::Priority::DEFAULT,
+            || glib::ControlFlow::Break,
+        );
+        let id = source.attach(Some(&context)).as_raw();
+        source.destroy();
+        id
+    };
+    let first = marker();
     let outcome = async {
-        let mut items = Vec::new();
         for _ in 0..128 {
-            items.push(
-                store
-                    .run_io("identity.credential.read", |service, key| {
-                        with_entry(service, key, |entry| {
-                            let item = entry.find()?.ok_or(ClientError::CredentialStore)?;
-                            item.load_secret_sync(gio::Cancellable::NONE)
-                                .map_err(|_| ClientError::CredentialStore)?;
-                            let value = item.secret().ok_or(ClientError::CredentialStore)?;
-                            assert_eq!(value.get(), b"owned-lifetime-fixture");
-                            let released = Arc::new(AtomicBool::new(false));
-                            let notification = released.clone();
-                            let _ = item.add_weak_ref_notify(move || {
-                                notification.store(true, Ordering::Release);
-                            });
-                            Ok(released)
-                        })
-                    })
-                    .await?,
+            assert_eq!(
+                store.read().await?.unwrap().as_slice(),
+                b"owned-lifetime-fixture"
             );
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while items
-            .iter()
-            .any(|released| !released.load(Ordering::Acquire))
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Completed native reads retained item proxies without an application main loop"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         Ok::<_, ClientError>(())
     }
     .await;
     store.delete().await.unwrap();
     outcome.unwrap();
+    let last = marker();
+    assert!((first..first + 100_000).contains(&last));
+    let retained = (first + 1..last)
+        .filter(|id| {
+            // SAFETY: this test process owns the context; the bounded IDs come
+            // from its actual attached markers. The borrowed pointer is only
+            // tested for presence, never dereferenced or adopted.
+            unsafe {
+                !glib::ffi::g_main_context_find_source_by_id(context.to_glib_none().0, *id)
+                    .is_null()
+            }
+        })
+        .count();
+    assert_eq!(
+        retained, 0,
+        "Native reads queued callbacks without an application main loop"
+    );
 }
 
 struct OwnedItems(Vec<Item>);
