@@ -11,6 +11,16 @@ thread_local! {
     // This proxy belongs to the native context, independently of other users
     // of libsecret's process-global default proxy.
     static SERVICE: std::cell::RefCell<Option<Service>> = const { std::cell::RefCell::new(None) };
+    // Attribute names/types are immutable metadata, shared by every entry.
+    // Construct once: the binding's constructor retains its temporary table.
+    static SCHEMA: Schema = Schema::new(
+        "ai.nddev.nds",
+        libsecret::SchemaFlags::DONT_MATCH_NAME,
+        HashMap::from([
+            ("service", libsecret::SchemaAttributeType::String),
+            ("username", libsecret::SchemaAttributeType::String),
+        ]),
+    );
 }
 
 pub(super) fn with_entry<T>(
@@ -57,14 +67,7 @@ impl Entry {
         }
         Ok(Self {
             service: native,
-            schema: Schema::new(
-                "ai.nddev.nds",
-                libsecret::SchemaFlags::DONT_MATCH_NAME,
-                HashMap::from([
-                    ("service", libsecret::SchemaAttributeType::String),
-                    ("username", libsecret::SchemaAttributeType::String),
-                ]),
-            ),
+            schema: SCHEMA.with(Clone::clone),
             // Preserve the previous provider's exact lookup across collections.
             attributes: HashMap::from([
                 ("service".into(), service.into()),
