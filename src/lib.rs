@@ -11,7 +11,7 @@ pub mod sync3_wire;
 pub mod sync_wire;
 pub mod telemetry;
 pub mod vault_wire;
-pub use sync::{SyncExpiry, SyncReply, SyncRequest};
+pub use sync::{SyncExpiry, SyncReply, SyncRequest, sync_wire_schema_version};
 mod devices;
 pub mod health_wire;
 mod offline;
@@ -21,7 +21,7 @@ mod store;
 mod transport;
 use runtime::Instant;
 pub mod wire;
-pub use store::SessionStore;
+pub use store::{SessionStore, authorization_fence_schema_version};
 #[cfg(not(target_arch = "wasm32"))]
 mod paths;
 #[cfg(not(target_arch = "wasm32"))]

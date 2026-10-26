@@ -15,6 +15,7 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod fence;
+pub use fence::authorization_fence_schema_version;
 #[cfg(target_os = "linux")]
 mod linux;
 pub(crate) use fence::{Fence, FenceMode};
