@@ -5,6 +5,12 @@ use http::Method;
 use nddev_device_sync_http_signatures as signatures;
 use ring::rand::{SecureRandom, SystemRandom};
 
+/// Active lifecycle wire schema enforced by this client, independent of local
+/// storage and the older operation formats retained for historical reads.
+pub const fn sync_wire_schema_version() -> u32 {
+    3
+}
+
 pub(crate) struct SigningContext {
     pub device: nddev_device_sync_domain::DeviceId,
     pub nonce: String,
@@ -203,7 +209,7 @@ pub(crate) fn decode_expired_v3(
         serde_json::from_slice(bytes).map_err(|_| ClientError::InvalidResponse)?;
     let floor = u64::try_from(value.floor_seq).map_err(|_| ClientError::InvalidResponse)?;
     let head = u64::try_from(value.head_seq).map_err(|_| ClientError::InvalidResponse)?;
-    if value.schema_version != 3 {
+    if value.schema_version != i64::from(sync_wire_schema_version()) {
         return Err(ClientError::InvalidResponse);
     }
     HistoryVersion {

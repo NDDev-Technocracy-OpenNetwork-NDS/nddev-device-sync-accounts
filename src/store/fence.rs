@@ -4,6 +4,14 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+const SCHEMA_VERSION: u32 = 1;
+
+/// Native authorization-fence format enforced by this implementation.
+/// This reads no credentials or database and grants no schema transition.
+pub const fn authorization_fence_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FenceMode {
@@ -105,8 +113,8 @@ mod native {
             if count != 0 {
                 return Err(ClientError::CredentialStore);
             }
-            db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE authorization(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation TEXT NOT NULL CHECK(length(generation)=43),mode TEXT NOT NULL CHECK(mode IN ('checking','denied','ready','signed_out','pending_logout')),slot INTEGER NOT NULL CHECK(slot IN (0,1))); PRAGMA user_version=1; COMMIT;").map_err(|_| ClientError::CredentialStore)?;
-        } else if version != 1 {
+            db.execute_batch(&format!("BEGIN IMMEDIATE; CREATE TABLE authorization(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation TEXT NOT NULL CHECK(length(generation)=43),mode TEXT NOT NULL CHECK(mode IN ('checking','denied','ready','signed_out','pending_logout')),slot INTEGER NOT NULL CHECK(slot IN (0,1))); PRAGMA user_version={SCHEMA_VERSION}; COMMIT;")).map_err(|_| ClientError::CredentialStore)?;
+        } else if version != SCHEMA_VERSION {
             return Err(ClientError::CredentialStore);
         }
         Ok(db)
