@@ -106,6 +106,56 @@ impl Entry {
     }
 
     pub(super) fn read(self) -> Result<Option<Zeroizing<Vec<u8>>>, ClientError> {
+        // Search afresh across all collections, retaining ambiguity checks.
+        // A path lookup avoids constructing an Item proxy and loading its
+        // unrelated properties for every protected authorization read.
+        // SAFETY: borrowed inputs outlive this synchronous call; both returned
+        // string arrays and GError transfer ownership and are adopted once.
+        let (unlocked, locked): (Vec<glib::GString>, Vec<glib::GString>) = unsafe {
+            let attributes = self.attributes.to_glib_full();
+            let mut unlocked = ptr::null_mut();
+            let mut locked = ptr::null_mut();
+            let mut error = ptr::null_mut();
+            let found = libsecret::ffi::secret_service_search_for_dbus_paths_sync(
+                self.service.to_glib_none().0,
+                self.schema.to_glib_none().0,
+                attributes,
+                ptr::null_mut(),
+                &mut unlocked,
+                &mut locked,
+                &mut error,
+            );
+            glib::ffi::g_hash_table_unref(attributes);
+            let paths = (
+                FromGlibPtrContainer::from_glib_full(unlocked),
+                FromGlibPtrContainer::from_glib_full(locked),
+            );
+            checked(error)?;
+            if found == glib::ffi::GFALSE {
+                return Err(ClientError::CredentialStore);
+            }
+            paths
+        };
+        if !locked.is_empty() {
+            // Preserve the existing unlock/prompt and declined-unlock behavior.
+            return self.read_item();
+        }
+        let path = match unlocked.as_slice() {
+            [] => return Ok(None),
+            [path] => path,
+            _ => return Err(ClientError::CredentialStore),
+        };
+        // Always retrieve the current secret. A lock/delete race is an error,
+        // never cached data or absence. Entry::new requires encrypted transport.
+        let value = self
+            .service
+            .secret_for_dbus_path_sync(path, gio::Cancellable::NONE)
+            .map_err(|_| ClientError::CredentialStore)?
+            .ok_or(ClientError::CredentialStore)?;
+        Ok(Some(Zeroizing::new(value.get().to_vec())))
+    }
+
+    fn read_item(self) -> Result<Option<Zeroizing<Vec<u8>>>, ClientError> {
         let Some(item) = self.find()? else {
             return Ok(None);
         };
