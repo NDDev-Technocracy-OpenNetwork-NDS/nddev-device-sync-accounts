@@ -15,6 +15,7 @@ pub use sync::{SyncExpiry, SyncReply, SyncRequest, sync_wire_schema_version};
 mod devices;
 pub mod health_wire;
 mod offline;
+mod personal_wire;
 pub use offline::{LocalUseFence, LocalUseLifetime};
 pub mod runtime;
 mod store;
@@ -1040,6 +1041,8 @@ impl IdentityClient {
         }
         let signed = signature.is_some();
         let capabilities_request = signed && method == Method::GET && path == "/v3/sync";
+        let personal_inventory =
+            method == Method::GET && path.split('?').next() == Some("/v3/personal/devices");
         let span = if path.starts_with("/v2/observability/") {
             tracing::Span::none()
         } else {
@@ -1075,6 +1078,9 @@ impl IdentityClient {
                 sync::validate_v3_reply_size(path, status, bytes.len())?;
             }
             if !status.is_success() {
+                if personal_inventory && status == StatusCode::NOT_FOUND {
+                    return Err(ClientError::Server("personal_context_unavailable".into()));
+                }
                 // Older servers have no capabilities route. Preserve only this
                 // fixed-route absence; Core still owns writer-mode admission.
                 if capabilities_request && status == StatusCode::NOT_FOUND {
@@ -1100,6 +1106,9 @@ impl IdentityClient {
                 }
                 let code = if path.starts_with("/v2/company") {
                     let response: company_wire::CompanyError = decode(&bytes)?;
+                    serde_json::to_value(response.error)
+                } else if personal_inventory {
+                    let response: personal_wire::Error = decode(&bytes)?;
                     serde_json::to_value(response.error)
                 } else {
                     let response: wire::Error = decode(&bytes)?;
