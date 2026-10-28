@@ -3,11 +3,12 @@
 // and request signatures remain in Rust. No request/response body is logged.
 const requests = new Map<string, AbortController>();
 const MAX_BYTES = 65536;
-const sync3Methods = new Map([
+const profileMethods = new Map([
   ["/v3/sync", "GET"],
   ["/v3/sync/operations", "POST"],
   ["/v3/sync/history", "GET"],
   ["/v3/sync/base", "GET"],
+  ["/v3/personal/devices", "GET"],
 ]);
 export function currentOrigin() {
   return globalThis.location?.origin ?? "";
@@ -34,7 +35,7 @@ export async function request(
     !(
       url.pathname.startsWith("/v2/") ||
       url.pathname === "/v1/health" ||
-      sync3Methods.get(url.pathname) === method
+      profileMethods.get(url.pathname) === method
     ) ||
     !["GET", "POST", "DELETE"].includes(method) ||
     !/^[A-Za-z0-9_-]{32,128}$/.test(id) ||

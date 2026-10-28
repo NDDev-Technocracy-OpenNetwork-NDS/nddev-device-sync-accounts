@@ -1,7 +1,10 @@
 //! Native device signing and the existing session-authorized enrollment protocol.
 //! Keys are persisted before network mutations; uncertain responses are reconciled
 //! against the retained public key, never by generating a replacement identity.
-use crate::{ClientError, IdentityClient, View, device_wire as dto, view::DeviceView};
+use crate::{
+    ClientError, IdentityClient, View, device_wire as dto, personal_wire as personal,
+    view::DeviceView,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use http::{Method, StatusCode};
@@ -244,12 +247,28 @@ impl IdentityClient {
         token: &crate::SessionCredential,
         cancel: &CancellationToken,
     ) -> Result<Vec<dto::Device>, ClientError> {
+        let principal = {
+            let _completion = self.cancellation.lock().unwrap_or_else(|e| e.into_inner());
+            if cancel.is_cancelled() {
+                return Err(ClientError::Cancelled);
+            }
+            let view = self.view();
+            if !view.authenticated {
+                return Err(ClientError::RevalidationRequired);
+            }
+            nddev_device_sync_domain::UserId::new(view.user_id)
+                .map_err(|_| ClientError::InvalidResponse)?
+        };
         let mut devices = Vec::new();
         let mut after = 0;
         // Four bounded pages cover the authoritative 128 retained identities.
         for _ in 0..4 {
-            let path = format!("/v2/devices?limit=32&cursor=devices.{after}");
-            let page: dto::DeviceList = self.get(&path, Some(token), cancel).await?;
+            let path = format!("/v3/personal/devices?limit=32&cursor=devices.{after}");
+            let page: personal::PersonalDeviceList = self.get(&path, Some(token), cancel).await?;
+            if cancel.is_cancelled() {
+                return Err(ClientError::Cancelled);
+            }
+            let page = personal_page(page, principal.as_str())?;
             if page.devices.len() > 32 || devices.len() + page.devices.len() > MAX_DEVICE_IDENTITIES
             {
                 return Err(ClientError::InvalidResponse);
@@ -346,6 +365,40 @@ impl IdentityClient {
     }
 }
 
+fn personal_page(
+    page: personal::PersonalDeviceList,
+    principal: &str,
+) -> Result<dto::DeviceList, ClientError> {
+    if page.context.principal_id != principal || page.context.space.id != principal {
+        return Err(ClientError::InvalidResponse);
+    }
+    Ok(dto::DeviceList {
+        devices: page
+            .devices
+            .into_iter()
+            .map(|value| dto::Device {
+                created_at: value.created_at,
+                device_id: value.device_id,
+                display_name: value.display_name,
+                public_key: value.public_key,
+                platform: match value.platform {
+                    personal::Platform::Android => dto::Platform::Android,
+                    personal::Platform::Web => dto::Platform::Web,
+                    personal::Platform::Ios => dto::Platform::Ios,
+                    personal::Platform::Linux => dto::Platform::Linux,
+                    personal::Platform::Macos => dto::Platform::Macos,
+                    personal::Platform::Windows => dto::Platform::Windows,
+                },
+                status: match value.status {
+                    personal::Status::Active => dto::Status::Active,
+                    personal::Status::Revoked => dto::Status::Revoked,
+                },
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
+    })
+}
+
 pub(crate) async fn read_key(
     store: &crate::SessionStore,
 ) -> Result<Option<SigningKey>, ClientError> {
@@ -440,6 +493,242 @@ fn platform() -> dto::Platform {
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "development-http", not(target_arch = "wasm32")))]
+    mod transport {
+        use super::*;
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+                mpsc,
+            },
+            thread::JoinHandle,
+            time::{Duration, Instant},
+        };
+
+        // Only transport replies are scripted. No credentials, device store or
+        // authorization grant is created by this fixture.
+        struct Peer {
+            endpoint: String,
+            requests: mpsc::Receiver<String>,
+            replies: mpsc::SyncSender<(u16, serde_json::Value)>,
+            stop: Arc<AtomicBool>,
+            worker: Option<JoinHandle<Vec<String>>>,
+        }
+
+        impl Peer {
+            fn new(count: usize) -> Self {
+                assert!((1..=2).contains(&count));
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+                listener.set_nonblocking(true).unwrap();
+                let (request_tx, requests) = mpsc::sync_channel(2);
+                let (replies, reply_rx) = mpsc::sync_channel::<(u16, serde_json::Value)>(2);
+                let stop = Arc::new(AtomicBool::new(false));
+                let stopping = stop.clone();
+                let worker = std::thread::spawn(move || {
+                    let mut paths = Vec::new();
+                    for _ in 0..count {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let mut stream = loop {
+                            if stopping.load(Ordering::Acquire) {
+                                return paths;
+                            }
+                            match listener.accept() {
+                                Ok((stream, _)) => break stream,
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::WouldBlock
+                                        && Instant::now() < deadline =>
+                                {
+                                    std::thread::sleep(Duration::from_millis(5))
+                                }
+                                Err(error) => panic!("bounded accept failed: {}", error.kind()),
+                            }
+                        };
+                        stream.set_nonblocking(false).unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        let mut bytes = Vec::new();
+                        while !bytes.ends_with(b"\r\n\r\n") {
+                            assert!(bytes.len() < 8192);
+                            stream
+                                .set_read_timeout(Some(
+                                    deadline
+                                        .checked_duration_since(Instant::now())
+                                        .expect("header deadline"),
+                                ))
+                                .unwrap();
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).unwrap();
+                            bytes.push(byte[0]);
+                        }
+                        let request = String::from_utf8(bytes).unwrap();
+                        let path = request.lines().next().unwrap().to_owned();
+                        paths.push(path.clone());
+                        if request_tx.send(path).is_err() {
+                            return paths;
+                        }
+                        let Ok((status, body)) = reply_rx.recv_timeout(Duration::from_secs(5))
+                        else {
+                            return paths;
+                        };
+                        let body = serde_json::to_vec(&body).unwrap();
+                        let mut reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+                        reply.extend_from_slice(&body);
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        // Cancellation can close the peer before its held reply.
+                        let _ = stream.write_all(&reply);
+                    }
+                    paths
+                });
+                Self {
+                    endpoint,
+                    requests,
+                    replies,
+                    stop,
+                    worker: Some(worker),
+                }
+            }
+
+            async fn requested(&self) -> String {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match self.requests.try_recv() {
+                            Ok(path) => return path,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                tokio::time::sleep(Duration::from_millis(5)).await
+                            }
+                            Err(error) => panic!("peer stopped before request: {error}"),
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+            }
+
+            fn finish(mut self) -> Vec<String> {
+                self.worker.take().unwrap().join().unwrap()
+            }
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Release);
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+
+        fn client(peer: &Peer) -> IdentityClient {
+            let client = IdentityClient::new(&peer.endpoint).unwrap();
+            let mut state = client.state.lock().unwrap();
+            state.view.authenticated = true;
+            state.view.user_id = "initiating-principal".into();
+            drop(state);
+            client
+        }
+
+        fn page(principal: &str) -> serde_json::Value {
+            serde_json::json!({"context":{"principal_id":principal,"space":{"kind":"personal","id":principal}},"devices":[],"next_cursor":null})
+        }
+
+        #[tokio::test]
+        async fn an_older_server_refuses_the_context_without_a_legacy_inventory_retry() {
+            let peer = Peer::new(1);
+            let client = client(&peer);
+            let cancel = CancellationToken::new();
+            let token = crate::SessionCredential::Bearer(Zeroizing::new("a".repeat(43)));
+            let (result, request) = tokio::join!(client.device_inventory(&token, &cancel), async {
+                let request = peer.requested().await;
+                peer.replies
+                    .send((404, serde_json::json!({"error":"fixture_absence"})))
+                    .unwrap();
+                request
+            });
+            let paths = peer.finish();
+            assert!(
+                matches!(result, Err(ClientError::Server(code)) if code == "personal_context_unavailable")
+            );
+            assert_eq!(paths, vec![request]);
+            assert!(paths[0].starts_with("GET /v3/personal/devices?"));
+        }
+
+        #[tokio::test]
+        async fn a_later_page_cannot_borrow_another_principals_context() {
+            let peer = Peer::new(2);
+            let client = client(&peer);
+            let cancel = CancellationToken::new();
+            let token = crate::SessionCredential::Bearer(Zeroizing::new("a".repeat(43)));
+            let (result, ()) = tokio::join!(client.device_inventory(&token, &cancel), async {
+                peer.requested().await;
+                let mut first = page("initiating-principal");
+                first["devices"] = serde_json::json!([{
+                    "device_id":"a".repeat(43), "display_name":"Synthetic transport", "platform":"linux", "status":"active", "created_at":"2026-01-01T00:00:00Z",
+                    "public_key":URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[7;32]).verifying_key().as_bytes()),
+                }]);
+                first["next_cursor"] = "devices.1".into();
+                peer.replies.send((200, first)).unwrap();
+                peer.requested().await;
+                peer.replies.send((200, page("another-principal"))).unwrap();
+            });
+            let paths = peer.finish();
+            assert!(matches!(result, Err(ClientError::InvalidResponse)));
+            assert_eq!(paths.len(), 2);
+            assert!(paths[1].contains("cursor=devices.1"));
+            assert!(client.view().devices.is_empty());
+        }
+
+        #[tokio::test]
+        async fn cancellation_rejects_a_held_original_context_reply() {
+            let peer = Peer::new(1);
+            let client = client(&peer);
+            let cancel = CancellationToken::new();
+            *client.cancellation.lock().unwrap() = cancel.clone();
+            let token = crate::SessionCredential::Bearer(Zeroizing::new("a".repeat(43)));
+            let (result, ()) = tokio::join!(client.device_inventory(&token, &cancel), async {
+                peer.requested().await;
+                client.cancel();
+                peer.replies
+                    .send((200, page("initiating-principal")))
+                    .unwrap();
+            });
+            assert_eq!(peer.finish().len(), 1);
+            assert!(matches!(result, Err(ClientError::Cancelled)));
+            assert!(client.view().devices.is_empty());
+        }
+    }
+
+    #[test]
+    fn personal_inventory_context_must_match_the_initiating_principal_on_every_page() {
+        let page = serde_json::json!({"context":{"principal_id":"principal","space":{"kind":"personal","id":"principal"}},"devices":[],"next_cursor":null});
+        assert!(personal_page(serde_json::from_value(page.clone()).unwrap(), "principal").is_ok());
+        for path in ["principal_id", "space"] {
+            let mut foreign = page.clone();
+            if path == "space" {
+                foreign["context"]["space"]["id"] = "foreign".into();
+            } else {
+                foreign["context"]["principal_id"] = "foreign".into();
+            }
+            assert!(matches!(
+                personal_page(serde_json::from_value(foreign).unwrap(), "principal"),
+                Err(ClientError::InvalidResponse)
+            ));
+        }
+        let mut organization = page.clone();
+        organization["context"]["space"]["kind"] = "organization".into();
+        assert!(serde_json::from_value::<personal::PersonalDeviceList>(organization).is_err());
+        let mut secret = page.clone();
+        secret["context"]["session_token"] = "injected".into();
+        assert!(serde_json::from_value::<personal::PersonalDeviceList>(secret).is_err());
+        let mut absent = page;
+        absent.as_object_mut().unwrap().remove("context");
+        assert!(serde_json::from_value::<personal::PersonalDeviceList>(absent).is_err());
+    }
+
     #[tokio::test]
     #[ignore = "requires an explicitly owned PostgreSQL/Mailpit fixture and unlocked native store"]
     async fn actual_enrollment_survives_client_recreation_and_revocation() {
@@ -455,6 +744,10 @@ mod tests {
         );
         assert!(owner.ends_with(".invalid") || owner.ends_with(".test"));
         let client = IdentityClient::new(endpoint).unwrap();
+        assert!(
+            client.store.read().await.unwrap().is_none(),
+            "fixture endpoint already has a native session; preserve it"
+        );
         client.refresh().await.unwrap();
         client.request_email(owner.into(), "en").await.unwrap();
         let code = tokio::time::timeout(std::time::Duration::from_secs(10), async {

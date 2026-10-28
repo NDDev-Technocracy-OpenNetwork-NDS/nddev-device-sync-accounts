@@ -184,4 +184,11 @@ member locally. An omitted selector is resolved only by the server's existing
 unambiguous-account rule. Registration rejects a selector and remains bound to
 the current authenticated session; selectors are never credential proof or logs.
 
+Device inventory uses the versioned personal-context response. Each page must
+match the principal captured when the operation started; cancellation prevents
+late publication. Original device/key storage bindings remain unchanged. Deploy
+the compatible server first: a missing personal inventory route returns
+`personal_context_unavailable` and never falls back to an unscoped list or starts
+dependent enrollment. Previously locked clients keep their original protocol.
+
 Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts/releases).
