@@ -1,8 +1,17 @@
-//! Closed company routes. Credentials and signing remain owned by Accounts.
-use crate::ClientError;
+//! Closed organization routes. Original credentials/signing remain in Accounts.
+use crate::{ClientError, organizations_wire as dto};
 use http::Method;
 
 pub enum CompanyRequest {
+    Organizations,
+    Create(Vec<u8>),
+    Scoped {
+        company: String,
+        revision: u64,
+        operation: CompanyOperation,
+    },
+}
+pub enum CompanyOperation {
     Overview,
     Members { after: Option<String> },
     Invitations { after: Option<String> },
@@ -12,98 +21,250 @@ pub enum CompanyRequest {
 }
 impl CompanyRequest {
     pub(crate) fn prepare(self) -> Result<(Method, String, Option<Vec<u8>>), ClientError> {
-        let (method, path, body) = match self {
-            Self::Overview => (Method::GET, "/v2/company".into(), None),
-            Self::Members { after } => (Method::GET, page("members", after)?, None),
-            Self::Invitations { after } => (Method::GET, page("invitations", after)?, None),
-            Self::Invite(body) => (Method::POST, "/v2/company/invitations".into(), Some(body)),
-            Self::Revoke { id, body } => {
-                identifier(&id)?;
-                (
-                    Method::POST,
-                    format!("/v2/company/invitations/{id}/revoke"),
-                    Some(body),
-                )
+        match self {
+            Self::Organizations => Ok((Method::GET, "/v3/organizations".into(), None)),
+            Self::Create(body) => {
+                bounded(&body)?;
+                let _: dto::OrganizationCreateRequest = decode(&body)?;
+                Ok((Method::POST, "/v3/organizations".into(), Some(body)))
             }
-            Self::ChangeMember { id, body } => {
-                identifier(&id)?;
-                (
-                    Method::POST,
-                    format!("/v2/company/members/{id}"),
-                    Some(body),
-                )
+            Self::Scoped {
+                company,
+                revision,
+                operation,
+            } => {
+                identifier(&company)?;
+                if !(1..=nddev_device_sync_domain::sync::MAX_REVISION).contains(&revision) {
+                    return Err(ClientError::InvalidInput);
+                }
+                let base = format!("/v3/organizations/{company}");
+                let (resource, after) = match operation {
+                    CompanyOperation::Overview => ("", None),
+                    CompanyOperation::Members { after } => ("/members", after),
+                    CompanyOperation::Invitations { after } => ("/invitations", after),
+                    CompanyOperation::Invite(body) => {
+                        bounded(&body)?;
+                        let value: dto::OrganizationInvitationRequest = decode(&body)?;
+                        return command(
+                            base + "/invitations",
+                            body,
+                            value.membership_revision,
+                            revision,
+                        );
+                    }
+                    CompanyOperation::Revoke { id, body } => {
+                        identifier(&id)?;
+                        bounded(&body)?;
+                        let value: dto::OrganizationRevokeRequest = decode(&body)?;
+                        return command(
+                            format!("{base}/invitations/{id}/revoke"),
+                            body,
+                            value.membership_revision,
+                            revision,
+                        );
+                    }
+                    CompanyOperation::ChangeMember { id, body } => {
+                        identifier(&id)?;
+                        bounded(&body)?;
+                        let value: dto::OrganizationMemberChangeRequest = decode(&body)?;
+                        return command(
+                            format!("{base}/members/{id}"),
+                            body,
+                            value.membership_revision,
+                            revision,
+                        );
+                    }
+                };
+                let mut path = format!("{base}{resource}?membership_revision={revision}");
+                if let Some(after) = after {
+                    identifier(&after)?;
+                    path.push_str("&after=");
+                    path.push_str(&after);
+                }
+                Ok((Method::GET, path, None))
             }
-        };
-        if body
-            .as_ref()
-            .is_some_and(|bytes| bytes.is_empty() || bytes.len() > 4096)
-        {
-            return Err(ClientError::InvalidInput);
         }
-        Ok((method, path, body))
     }
 }
+fn command(
+    path: String,
+    body: Vec<u8>,
+    captured: i64,
+    revision: u64,
+) -> Result<(Method, String, Option<Vec<u8>>), ClientError> {
+    if u64::try_from(captured).ok() != Some(revision) {
+        return Err(ClientError::InvalidInput);
+    }
+    // The exact original bytes, including captured revision, are signed.
+    // Never rewrite a retry's payload or membership epoch.
+    Ok((Method::POST, path, Some(body)))
+}
+fn bounded(body: &[u8]) -> Result<(), ClientError> {
+    if body.is_empty() || body.len() > 4096 {
+        Err(ClientError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
+    serde_json::from_slice(body).map_err(|_| ClientError::InvalidInput)
+}
 fn identifier(id: &str) -> Result<(), ClientError> {
-    if crate::valid_id(id) && id.len() <= 128 {
+    if crate::valid_id(id) && id.len() <= 128 && !matches!(id, "." | "..") {
         Ok(())
     } else {
         Err(ClientError::InvalidInput)
     }
 }
-fn page(resource: &str, after: Option<String>) -> Result<String, ClientError> {
-    match after {
-        Some(after) => {
-            identifier(&after)?;
-            Ok(format!("/v2/company/{resource}?after={after}"))
-        }
-        None => Ok(format!("/v2/company/{resource}")),
-    }
-}
 pub(crate) fn route_template(path: &str) -> Option<&'static str> {
-    if path.starts_with("/v2/company/invitations/") {
-        Some("/v2/company/invitations/{invitation_id}/revoke")
-    } else if path.starts_with("/v2/company/members/") {
-        Some("/v2/company/members/{user_id}")
-    } else {
-        None
+    let path = path.split('?').next()?;
+    if path == "/v3/organizations" {
+        return Some("/v3/organizations");
+    }
+    let parts = path
+        .strip_prefix("/v3/organizations/")?
+        .split('/')
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [_] => Some("/v3/organizations/{company_id}"),
+        [_, "members"] => Some("/v3/organizations/{company_id}/members"),
+        [_, "invitations"] => Some("/v3/organizations/{company_id}/invitations"),
+        [_, "members", _] => Some("/v3/organizations/{company_id}/members/{user_id}"),
+        [_, "invitations", _, "revoke"] => {
+            Some("/v3/organizations/{company_id}/invitations/{invitation_id}/revoke")
+        }
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn scoped(company: &str, revision: u64, operation: CompanyOperation) -> CompanyRequest {
+        CompanyRequest::Scoped {
+            company: company.into(),
+            revision,
+            operation,
+        }
+    }
     #[test]
-    fn routes_reject_path_query_injection_and_unbounded_bodies() {
-        for id in ["", "../other", "user?after=x", "a/b", "%2f", "a#b"] {
+    fn scoped_routes_reject_injection_and_preserve_the_captured_revision() {
+        for id in [
+            "",
+            ".",
+            "..",
+            "../other",
+            "user?after=x",
+            "a/b",
+            "%2f",
+            "a#b",
+        ] {
+            assert!(scoped(id, 4, CompanyOperation::Overview).prepare().is_err());
             assert!(
-                CompanyRequest::Members {
-                    after: Some(id.into())
-                }
+                scoped(
+                    "company",
+                    4,
+                    CompanyOperation::Members {
+                        after: Some(id.into())
+                    }
+                )
                 .prepare()
                 .is_err()
             );
             assert!(
-                CompanyRequest::ChangeMember {
-                    id: id.into(),
-                    body: vec![1]
-                }
+                scoped(
+                    "company",
+                    4,
+                    CompanyOperation::ChangeMember {
+                        id: id.into(),
+                        body: vec![1]
+                    }
+                )
                 .prepare()
                 .is_err()
             );
         }
-        assert!(CompanyRequest::Invite(vec![1; 4097]).prepare().is_err());
+        for revision in [
+            0,
+            nddev_device_sync_domain::sync::MAX_REVISION + 1,
+            u64::MAX,
+        ] {
+            assert!(
+                scoped("company", revision, CompanyOperation::Overview)
+                    .prepare()
+                    .is_err()
+            );
+        }
         assert_eq!(
-            CompanyRequest::Members {
-                after: Some("user_1".into())
-            }
+            scoped(
+                "company",
+                4,
+                CompanyOperation::Members {
+                    after: Some("user_1".into())
+                }
+            )
             .prepare()
             .unwrap()
             .1,
-            "/v2/company/members?after=user_1"
+            "/v3/organizations/company/members?membership_revision=4&after=user_1"
         );
         assert_eq!(
-            route_template("/v2/company/invitations/private/revoke"),
-            Some("/v2/company/invitations/{invitation_id}/revoke")
+            route_template("/v3/organizations/private/members/user?membership_revision=4"),
+            Some("/v3/organizations/{company_id}/members/{user_id}")
+        );
+    }
+    #[test]
+    fn command_body_cannot_be_rebound_to_another_membership_or_normalized() {
+        let original=br#" {"membership_revision":4,"payload":{"operation_id":"01900000-0000-7000-8000-000000000001"}} "#.to_vec();
+        let result = scoped(
+            "company",
+            4,
+            CompanyOperation::Revoke {
+                id: "A".repeat(43),
+                body: original.clone(),
+            },
+        )
+        .prepare()
+        .unwrap();
+        assert_eq!(result.0, Method::POST);
+        assert_eq!(result.2, Some(original.clone()));
+        assert!(
+            scoped(
+                "company",
+                5,
+                CompanyOperation::Revoke {
+                    id: "A".repeat(43),
+                    body: original
+                }
+            )
+            .prepare()
+            .is_err()
+        );
+        for body in [
+            vec![1; 4097],
+            br#"{"payload":{"operation_id":"id"}}"#.to_vec(),
+            br#"{"membership_revision":4,"payload":{"operation_id":"id","tenant_id":"injected"}}"#
+                .to_vec(),
+        ] {
+            assert!(
+                scoped(
+                    "company",
+                    4,
+                    CompanyOperation::Revoke {
+                        id: "A".repeat(43),
+                        body
+                    }
+                )
+                .prepare()
+                .is_err()
+            );
+        }
+        assert!(
+            CompanyRequest::Create(
+                br#"{"operation_id":"id","display_name":"name","role":"admin"}"#.to_vec()
+            )
+            .prepare()
+            .is_err()
         );
     }
 }

@@ -4,6 +4,7 @@ pub mod company_wire;
 pub mod device_wire;
 pub mod invitation;
 pub mod observability_wire;
+pub mod organizations_wire;
 pub mod screen;
 pub mod screen_wire;
 mod sync;
@@ -1078,6 +1079,9 @@ impl IdentityClient {
                 sync::validate_v3_reply_size(path, status, bytes.len())?;
             }
             if !status.is_success() {
+                if path.starts_with("/v3/organizations") && status == StatusCode::NOT_FOUND {
+                    return Err(ClientError::Server("organization_context_unavailable".into()));
+                }
                 if personal_inventory && status == StatusCode::NOT_FOUND {
                     return Err(ClientError::Server("personal_context_unavailable".into()));
                 }
@@ -1104,7 +1108,7 @@ impl IdentityClient {
                 if signed && status==StatusCode::CONFLICT && matches!(serde_json::from_slice::<sync_wire::Sync>(&bytes), Ok(sync_wire::Sync::Conflict(_))) {
                     return Ok((status,bytes));
                 }
-                let code = if path.starts_with("/v2/company") {
+                let code = if path.starts_with("/v2/company") || path.starts_with("/v3/organizations") {
                     let response: company_wire::CompanyError = decode(&bytes)?;
                     serde_json::to_value(response.error)
                 } else if personal_inventory {
