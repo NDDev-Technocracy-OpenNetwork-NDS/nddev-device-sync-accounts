@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory() as directory:
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(temporary, filter="data")
     subprocess.run(["bun", "install", "--frozen-lockfile", "--ignore-scripts"], cwd=temporary, check=True, timeout=120)
-    for profile, filename in [("company", "company_wire.rs"), ("auth", "wire.rs"), ("health", "health_wire.rs"), ("devices", "device_wire.rs"), ("personal", "personal_wire.rs"), ("sync", "sync_wire.rs"), ("sync3", "sync3_wire.rs"), ("vault", "vault_wire.rs"), ("observability", "observability_wire.rs"), ("screen", "screen_wire.rs")]:
+    for profile, filename in [("company", "company_wire.rs"), ("organizations", "organizations_wire.rs"), ("auth", "wire.rs"), ("health", "health_wire.rs"), ("devices", "device_wire.rs"), ("personal", "personal_wire.rs"), ("sync", "sync_wire.rs"), ("sync3", "sync3_wire.rs"), ("vault", "vault_wire.rs"), ("observability", "observability_wire.rs"), ("screen", "screen_wire.rs")]:
         generated = temporary / filename
         subprocess.run(["node", "scripts/generate-dtos.mjs", "rust", profile, str(generated)], cwd=temporary, check=True)
         subprocess.run(["rustfmt", "--edition", "2024", str(generated)], check=True)
