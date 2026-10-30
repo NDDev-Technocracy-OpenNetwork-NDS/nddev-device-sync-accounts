@@ -10,6 +10,17 @@ const profileMethods = new Map([
     ["/v3/sync/base", "GET"],
     ["/v3/personal/devices", "GET"],
 ]);
+const organizationPath = "/v3/organizations";
+const identifier = "[A-Za-z0-9_.:-]{1,128}";
+const organizationReads = new RegExp(`^${organizationPath}/${identifier}(?:/(?:members|invitations))?$`);
+const organizationWrites = new RegExp(`^${organizationPath}/${identifier}/(?:invitations(?:/${identifier}/revoke)?|members/${identifier})$`);
+function organizationMethod(path, method) {
+    if (path === organizationPath)
+        return method === "GET" || method === "POST";
+    return method === "GET"
+        ? organizationReads.test(path)
+        : method === "POST" && organizationWrites.test(path);
+}
 export function currentOrigin() {
     return globalThis.location?.origin ?? "";
 }
@@ -25,7 +36,8 @@ export async function request(id, target, method, headerJson, input, hasBody) {
         url.hash ||
         !(url.pathname.startsWith("/v2/") ||
             url.pathname === "/v1/health" ||
-            profileMethods.get(url.pathname) === method) ||
+            profileMethods.get(url.pathname) === method ||
+            organizationMethod(url.pathname, method)) ||
         !["GET", "POST", "DELETE"].includes(method) ||
         !/^[A-Za-z0-9_-]{32,128}$/.test(id) ||
         requests.has(id) ||
