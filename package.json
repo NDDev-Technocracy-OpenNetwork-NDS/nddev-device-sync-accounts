@@ -5,7 +5,8 @@
   "type": "module",
   "packageManager": "bun@1.4.3",
   "scripts": {
-    "check": "tsc --noEmit && biome check src/*.ts",
+    "check": "tsc --noEmit && biome check src/*.ts && bun run test:browser-http",
+    "test:browser-http": "bun test src/browser_http.test.ts",
     "generate": "tsc",
     "check:generated": "tsc && git diff --exit-code -- src/browser_credentials.js src/browser_http.js"
   },
