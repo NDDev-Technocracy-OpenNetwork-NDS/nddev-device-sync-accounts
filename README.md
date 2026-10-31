@@ -191,13 +191,14 @@ the compatible server first: a missing personal inventory route returns
 `personal_context_unavailable` and never falls back to an unscoped list or starts
 dependent enrollment. Previously locked clients keep their original protocol.
 
-`device_policy(fence)` reads this installation's own device control policy
-(ADR 0018) and `replace_device_policy(fence, …)` replaces it by compare-and-set.
-Both run under the caller's original local-use fence and require the reply to
-name the same principal and device; a reply held across sign-out or replacement
-is not published. Refusals stay typed (`operation_conflict`,
-`recent_authentication_required`, `invalid_request`); an older server without the
-route returns `device_policy_unavailable`. Accounts never chooses a mode: callers
-decide how an unreachable policy affects admission.
+`device_policy(fence)` reads this installation's own device control policy (ADR
+0018) and `replace_device_policy(fence, …)` replaces it by compare-and-set. Both
+run under the caller's original local-use fence and require the reply to name
+the same principal and device; a reply held across sign-out or replacement is
+not published. They queue fairly with signed replication rather than failing a
+foreground try-lock. Refusals stay typed (`operation_conflict`,
+`recent_authentication_required`, `invalid_request`); an older server without
+the route returns `device_policy_unavailable`. Accounts never chooses a mode:
+callers decide how an unreachable policy affects admission.
 
 Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts/releases).
