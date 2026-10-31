@@ -1044,6 +1044,7 @@ impl IdentityClient {
         let capabilities_request = signed && method == Method::GET && path == "/v3/sync";
         let personal_inventory =
             method == Method::GET && path.split('?').next() == Some("/v3/personal/devices");
+        let device_policy = path.starts_with("/v3/personal/devices/") && path.ends_with("/policy");
         let span = if path.starts_with("/v2/observability/") {
             tracing::Span::none()
         } else {
@@ -1060,6 +1061,8 @@ impl IdentityClient {
             && !matches!(path, "/v2/devices/challenges" | "/v2/devices/enrollments")
         {
             "/v2/devices/{device_id}"
+        } else if device_policy {
+            "/v3/personal/devices/{device_id}/policy"
         } else if method == Method::DELETE && path.starts_with("/v2/auth/passkeys/") {
             "/v2/auth/passkeys/{id}"
         } else {
@@ -1084,6 +1087,10 @@ impl IdentityClient {
                 }
                 if personal_inventory && status == StatusCode::NOT_FOUND {
                     return Err(ClientError::Server("personal_context_unavailable".into()));
+                }
+                // An older server has no policy route; never guess a mode.
+                if device_policy && status == StatusCode::NOT_FOUND {
+                    return Err(ClientError::Server("device_policy_unavailable".into()));
                 }
                 // Older servers have no capabilities route. Preserve only this
                 // fixed-route absence; Core still owns writer-mode admission.
