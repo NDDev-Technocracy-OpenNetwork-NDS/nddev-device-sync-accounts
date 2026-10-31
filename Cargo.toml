@@ -17,8 +17,8 @@ nddev-device-sync-http-signatures = { git = "https://github.com/NDDev-Technocrac
 base64 = "0.23.1"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 ring = "0.17"
-nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "088e658126c7aabe637b782c1a152f90fce0b47f" }
-nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "088e658126c7aabe637b782c1a152f90fce0b47f" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "ad614122d5916accbe1cca198768968b8c5bad0e" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "ad614122d5916accbe1cca198768968b8c5bad0e" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.1"

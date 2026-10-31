@@ -8,7 +8,7 @@ pub(crate) struct OperationPermit {
     _lease: Arc<Lease>,
 }
 
-/// One RDS endpoint owns this purpose lock, without holding identity admission.
+/// One remote-module endpoint owns this purpose lock, without holding identity admission.
 pub(crate) struct RdsLease {
     _lease: Arc<Lease>,
 }
