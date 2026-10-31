@@ -21,7 +21,7 @@ mod linux;
 pub(crate) use fence::{Fence, FenceMode};
 mod admission;
 pub(crate) use admission::OperationPermit;
-pub(crate) use admission::RdsLease;
+pub(crate) use admission::RemoteLease;
 
 const SERVICE: &str = "ai.nddev.nds.session.v2";
 // One platform call and at most seven waiting callers per endpoint. Waiting is

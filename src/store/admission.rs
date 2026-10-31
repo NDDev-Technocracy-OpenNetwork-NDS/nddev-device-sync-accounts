@@ -9,7 +9,7 @@ pub(crate) struct OperationPermit {
 }
 
 /// One remote-module endpoint owns this purpose lock, without holding identity admission.
-pub(crate) struct RdsLease {
+pub(crate) struct RemoteLease {
     _lease: Arc<Lease>,
 }
 
@@ -88,7 +88,7 @@ mod web {
 }
 
 impl SessionStore {
-    pub(crate) async fn rds_lease(&self) -> Result<RdsLease, ClientError> {
+    pub(crate) async fn remote_lease(&self) -> Result<RemoteLease, ClientError> {
         if self.service != "ai.nddev.nds.rds.v1" {
             return Err(ClientError::InvalidInput);
         }
@@ -105,7 +105,7 @@ impl SessionStore {
         };
         #[cfg(target_arch = "wasm32")]
         let lease = web::acquire(&self.key).await?;
-        Ok(RdsLease { _lease: lease })
+        Ok(RemoteLease { _lease: lease })
     }
 
     pub(crate) async fn activate_operation(
