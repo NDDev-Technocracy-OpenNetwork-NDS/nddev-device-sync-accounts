@@ -409,7 +409,10 @@ impl IdentityClient {
         fence: &crate::LocalUseFence,
         update: Option<personal::DevicePolicyUpdate>,
     ) -> Result<DevicePolicy, ClientError> {
-        let (_permit, cancel) = self.operation().await?;
+        // Module admission control traffic shares the identity writer fairly
+        // with signed replication instead of failing its foreground try-lock.
+        let permit = self.store.signed_operation().await?;
+        let (_permit, cancel) = self.activate_operation(permit).await?;
         self.validate_local_use(fence).await?;
         let view = self.view();
         if !view.authenticated {
