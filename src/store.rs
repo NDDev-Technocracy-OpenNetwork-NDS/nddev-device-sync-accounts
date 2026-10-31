@@ -21,7 +21,7 @@ mod linux;
 pub(crate) use fence::{Fence, FenceMode};
 mod admission;
 pub(crate) use admission::OperationPermit;
-pub(crate) use admission::RdsLease;
+pub(crate) use admission::RemoteLease;
 
 const SERVICE: &str = "ai.nddev.nds.session.v2";
 // One platform call and at most seven waiting callers per endpoint. Waiting is
@@ -149,7 +149,9 @@ impl SessionStore {
         store
     }
 
-    pub(crate) fn rds_store(&self, tenant: &str, user: &str, device: &str) -> Self {
+    /// Remote-module purpose store. The `rds.v1` seed label and service name are
+    /// frozen legacy identifiers, so existing endpoint keys stay addressable.
+    pub(crate) fn remote_store(&self, tenant: &str, user: &str, device: &str) -> Self {
         let mut digest = Sha256::new();
         for value in ["rds.v1", &self.key, tenant, user, device] {
             digest.update((value.len() as u64).to_be_bytes());
@@ -406,7 +408,7 @@ mod compatibility_tests {
             "8534cc9087ec67322196e2b2478ff5c3d7e6090947002234b5f1b9e08fee1707"
         );
         assert_eq!(
-            store.rds_store("tenant", "user", "device").key,
+            store.remote_store("tenant", "user", "device").key,
             "cd30eea48d9f2c4ccca7c95e7877cd67f282d70be5067ebae7a50aad875e48e1"
         );
         assert_eq!(

@@ -107,7 +107,7 @@ struct State {
     // Local-use handles expire on client cancellation, independently of request
     // tokens that rotate for each NDS operation. No authority is stored here.
     local_use_generation: Arc<()>,
-    rds_key: std::sync::Weak<Mutex<Option<screen::KeyMaterial>>>,
+    remote_key: std::sync::Weak<Mutex<Option<screen::KeyMaterial>>>,
 }
 
 /// One bounded operation per client; concurrent calls fail instead of queuing.

@@ -1,5 +1,6 @@
 //! Rust-only protected endpoint keys and canonical screen control calls.
-//! Native RDS owns endpoint/media I/O and grant verification; metadata is not consent.
+//! The native remote module owns endpoint/media I/O and grant verification;
+//! metadata is not consent.
 use crate::{ClientError, IdentityClient, LocalUseFence, State, screen_wire as dto};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -23,7 +24,7 @@ pub(crate) struct KeyMaterial {
 
 /// One protected purpose key/endpoint instance. No serialized or UI key handle.
 /// The caller closes its native endpoint before dropping this owner.
-pub struct RdsEndpointKey {
+pub struct RemoteEndpointKey {
     fence: LocalUseFence,
     device: DeviceId,
     instance: uuid::Uuid,
@@ -31,9 +32,9 @@ pub struct RdsEndpointKey {
     key: Arc<Mutex<Option<KeyMaterial>>>,
     // Native teardown may still own a copied key. Exclusivity ends only when
     // this opaque owner is dropped after that endpoint has actually closed.
-    _lease: crate::store::RdsLease,
+    _lease: crate::store::RemoteLease,
 }
-impl RdsEndpointKey {
+impl RemoteEndpointKey {
     pub fn device(&self) -> &DeviceId {
         &self.device
     }
@@ -95,16 +96,16 @@ impl RdsEndpointKey {
         body
     }
 }
-impl Drop for RdsEndpointKey {
+impl Drop for RemoteEndpointKey {
     fn drop(&mut self) {
         self.key.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 pub(crate) fn close_key(state: &mut State) {
-    if let Some(key) = state.rds_key.upgrade() {
+    if let Some(key) = state.remote_key.upgrade() {
         key.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
-    state.rds_key = std::sync::Weak::new();
+    state.remote_key = std::sync::Weak::new();
 }
 
 /// The exact original create body remains owned across uncertain HTTP responses.
@@ -164,7 +165,7 @@ pub struct ScreenDelivery {
 pub(crate) enum Request<'a> {
     Targets(&'a UserId),
     Binding(&'a DeviceId),
-    Bind(&'a RdsEndpointKey, u64),
+    Bind(&'a RemoteEndpointKey, u64),
     Create(&'a ScreenCreate),
     Incoming,
     View(&'a str),
@@ -264,7 +265,7 @@ impl IdentityClient {
     }
 
     /// Persist/reconcile a distinct purpose seed before binding a native endpoint.
-    pub async fn rds_endpoint_key(&self) -> Result<RdsEndpointKey, ClientError> {
+    pub async fn remote_endpoint_key(&self) -> Result<RemoteEndpointKey, ClientError> {
         let (_permit, cancel) = self.operation().await?;
         let fence = self.local_use_fence().await?;
         let view = self.view();
@@ -272,11 +273,11 @@ impl IdentityClient {
             DeviceId::new(view.current_device_id).map_err(|_| ClientError::RevalidationRequired)?;
         let store = self
             .store
-            .rds_store(&view.tenant_id, &view.user_id, device.as_str());
+            .remote_store(&view.tenant_id, &view.user_id, device.as_str());
         let lease = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ClientError::Cancelled),
-            result = store.rds_lease() => result?,
+            result = store.remote_lease() => result?,
         };
         self.validate_local_use(&fence).await?;
         let seed = match store.read().await? {
@@ -311,9 +312,9 @@ impl IdentityClient {
             if cancel.is_cancelled() {
                 return Err(ClientError::Cancelled);
             }
-            state.rds_key = Arc::downgrade(&key);
+            state.remote_key = Arc::downgrade(&key);
         }
-        Ok(RdsEndpointKey {
+        Ok(RemoteEndpointKey {
             fence,
             device,
             instance: uuid::Uuid::new_v4(),
@@ -324,9 +325,9 @@ impl IdentityClient {
     }
 
     /// Privileged Rust endpoint composition only. No automatic per-frame I/O.
-    pub async fn rds_key_material(
+    pub async fn remote_key_material(
         &self,
-        key: &RdsEndpointKey,
+        key: &RemoteEndpointKey,
     ) -> Result<Zeroizing<[u8; 32]>, ClientError> {
         self.validate_local_use(key.fence()).await?;
         let material = key.key.lock().unwrap_or_else(|e| e.into_inner());
@@ -358,7 +359,7 @@ impl IdentityClient {
     }
     pub async fn screen_bind(
         &self,
-        key: &RdsEndpointKey,
+        key: &RemoteEndpointKey,
         original_base: u64,
     ) -> Result<EndpointBinding, ClientError> {
         let reply = self
