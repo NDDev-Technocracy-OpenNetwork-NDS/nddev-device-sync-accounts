@@ -409,7 +409,10 @@ impl IdentityClient {
         fence: &crate::LocalUseFence,
         update: Option<personal::DevicePolicyUpdate>,
     ) -> Result<DevicePolicy, ClientError> {
-        let (_permit, cancel) = self.operation().await?;
+        // Module admission control traffic shares the identity writer fairly
+        // with signed replication instead of failing its foreground try-lock.
+        let permit = self.store.signed_operation().await?;
+        let (_permit, cancel) = self.activate_operation(permit).await?;
         self.validate_local_use(fence).await?;
         let view = self.view();
         if !view.authenticated {
@@ -701,7 +704,21 @@ mod tests {
                             bytes.push(byte[0]);
                         }
                         let request = String::from_utf8(bytes).unwrap();
-                        let path = request.lines().next().unwrap().to_owned();
+                        // Consume a declared request body before replying: closing a
+                        // socket with unread data resets the connection on Windows.
+                        let length = request
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+                        assert!(length <= 8192);
+                        let mut body = vec![0; length];
+                        stream.read_exact(&mut body).unwrap();
+                        let mut path = request.lines().next().unwrap().to_owned();
+                        if length > 0 {
+                            path.push(' ');
+                            path.push_str(std::str::from_utf8(&body).unwrap());
+                        }
                         paths.push(path.clone());
                         if request_tx.send(path).is_err() {
                             return paths;
@@ -878,6 +895,12 @@ mod tests {
                 )
                 .await;
                 assert!(request.starts_with("PUT /v3/personal/devices/own-device/policy"));
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once(" HTTP/1.1 ").unwrap().1).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({"expected_revision":2,"mode":"fullauto","purposes":["desktop"]})
+                );
                 assert!(matches!(result, Err(ClientError::Server(value)) if value == code));
             }
             let peer = Peer::new(1);
