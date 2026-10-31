@@ -8,8 +8,11 @@ use crate::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use http::{Method, StatusCode};
-use nddev_device_sync_domain::devices::{DeviceName, ENROLLMENT_DOMAIN, MAX_DEVICE_IDENTITIES};
+use nddev_device_sync_domain::devices::{
+    ControlMode, DeviceName, DevicePolicy, DevicePurpose, ENROLLMENT_DOMAIN, MAX_DEVICE_IDENTITIES,
+};
 use ring::rand::{SecureRandom, SystemRandom};
+use std::collections::BTreeSet;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -365,6 +368,140 @@ impl IdentityClient {
     }
 }
 
+impl IdentityClient {
+    /// Authenticated control policy of this installation's own enrolled device
+    /// (ADR 0018). The read is bound to the caller's original local-use fence,
+    /// so its result is never published across sign-out or identity replacement.
+    pub async fn device_policy(
+        &self,
+        fence: &crate::LocalUseFence,
+    ) -> Result<DevicePolicy, ClientError> {
+        self.device_policy_fenced(fence, None).await
+    }
+
+    /// Compare-and-set replacement of this device's policy by its owner. A
+    /// stale revision returns `operation_conflict`; widening manual into
+    /// fullauto without a recent sign-in returns `recent_authentication_required`.
+    pub async fn replace_device_policy(
+        &self,
+        fence: &crate::LocalUseFence,
+        expected_revision: u64,
+        mode: ControlMode,
+        purposes: BTreeSet<DevicePurpose>,
+    ) -> Result<DevicePolicy, ClientError> {
+        let update = personal::DevicePolicyUpdate {
+            expected_revision: i64::try_from(expected_revision)
+                .map_err(|_| ClientError::InvalidInput)?,
+            mode: match mode {
+                ControlMode::Fullauto => personal::ControlMode::Fullauto,
+                ControlMode::Manual => personal::ControlMode::Manual,
+            },
+            purposes: purposes.into_iter().map(wire_purpose).collect(),
+        };
+        if update.purposes.is_empty() || expected_revision == 0 {
+            return Err(ClientError::InvalidInput);
+        }
+        self.device_policy_fenced(fence, Some(update)).await
+    }
+
+    async fn device_policy_fenced(
+        &self,
+        fence: &crate::LocalUseFence,
+        update: Option<personal::DevicePolicyUpdate>,
+    ) -> Result<DevicePolicy, ClientError> {
+        let (_permit, cancel) = self.operation().await?;
+        self.validate_local_use(fence).await?;
+        let view = self.view();
+        if !view.authenticated {
+            return Err(ClientError::RevalidationRequired);
+        }
+        let principal = nddev_device_sync_domain::UserId::new(view.user_id)
+            .map_err(|_| ClientError::InvalidResponse)?;
+        let device = nddev_device_sync_domain::DeviceId::new(view.current_device_id)
+            .map_err(|_| ClientError::RevalidationRequired)?;
+        let token = self.session_credential().await?;
+        let policy = self
+            .device_policy_exchange(&token, &principal, &device, update.as_ref(), &cancel)
+            .await?;
+        // A reply held across sign-out or replacement is never published.
+        self.validate_local_use(fence).await?;
+        Ok(policy)
+    }
+
+    async fn device_policy_exchange(
+        &self,
+        token: &crate::SessionCredential,
+        principal: &nddev_device_sync_domain::UserId,
+        device: &nddev_device_sync_domain::DeviceId,
+        update: Option<&personal::DevicePolicyUpdate>,
+        cancel: &CancellationToken,
+    ) -> Result<DevicePolicy, ClientError> {
+        let path = format!("/v3/personal/devices/{}/policy", device.as_str());
+        let (status, body) = match update {
+            None => {
+                self.request::<()>(Method::GET, &path, None, Some(token), "en", cancel)
+                    .await?
+            }
+            Some(update) => {
+                self.request(Method::PUT, &path, Some(update), Some(token), "en", cancel)
+                    .await?
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+        if status != StatusCode::OK {
+            return Err(ClientError::InvalidResponse);
+        }
+        let reply: personal::PersonalDevicePolicy = crate::decode(&body)?;
+        if reply.context.principal_id != principal.as_str()
+            || reply.context.space.id != principal.as_str()
+            || reply.device_id != device.as_str()
+        {
+            return Err(ClientError::InvalidResponse);
+        }
+        let mode = match reply.policy.mode {
+            personal::ControlMode::Fullauto => ControlMode::Fullauto,
+            personal::ControlMode::Manual => ControlMode::Manual,
+        };
+        let count = reply.policy.purposes.len();
+        let purposes = reply
+            .policy
+            .purposes
+            .into_iter()
+            .map(domain_purpose)
+            .collect::<BTreeSet<_>>();
+        if purposes.len() != count {
+            return Err(ClientError::InvalidResponse);
+        }
+        let revision =
+            u64::try_from(reply.policy.revision).map_err(|_| ClientError::InvalidResponse)?;
+        DevicePolicy::new(mode, purposes, revision).map_err(|_| ClientError::InvalidResponse)
+    }
+}
+
+fn wire_purpose(value: DevicePurpose) -> personal::DevicePurpose {
+    match value {
+        DevicePurpose::ServerHosting => personal::DevicePurpose::ServerHosting,
+        DevicePurpose::ServerDevDesktop => personal::DevicePurpose::ServerDevDesktop,
+        DevicePurpose::ServerDesktop => personal::DevicePurpose::ServerDesktop,
+        DevicePurpose::BuildDevDesktop => personal::DevicePurpose::BuildDevDesktop,
+        DevicePurpose::DevDesktop => personal::DevicePurpose::DevDesktop,
+        DevicePurpose::Desktop => personal::DevicePurpose::Desktop,
+    }
+}
+
+fn domain_purpose(value: personal::DevicePurpose) -> DevicePurpose {
+    match value {
+        personal::DevicePurpose::ServerHosting => DevicePurpose::ServerHosting,
+        personal::DevicePurpose::ServerDevDesktop => DevicePurpose::ServerDevDesktop,
+        personal::DevicePurpose::ServerDesktop => DevicePurpose::ServerDesktop,
+        personal::DevicePurpose::BuildDevDesktop => DevicePurpose::BuildDevDesktop,
+        personal::DevicePurpose::DevDesktop => DevicePurpose::DevDesktop,
+        personal::DevicePurpose::Desktop => DevicePurpose::Desktop,
+    }
+}
+
 fn personal_page(
     page: personal::PersonalDeviceList,
     principal: &str,
@@ -634,6 +771,121 @@ mod tests {
 
         fn page(principal: &str) -> serde_json::Value {
             serde_json::json!({"context":{"principal_id":principal,"space":{"kind":"personal","id":principal}},"devices":[],"next_cursor":null})
+        }
+
+        fn policy_reply(
+            principal: &str,
+            device: &str,
+            purposes: serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!({"context":{"principal_id":principal,"space":{"kind":"personal","id":principal}},
+                "device_id":device,"policy":{"mode":"fullauto","purposes":purposes,"revision":3}})
+        }
+
+        async fn exchange(
+            peer: &Peer,
+            update: Option<personal::DevicePolicyUpdate>,
+            reply: (u16, serde_json::Value),
+        ) -> (Result<DevicePolicy, ClientError>, String) {
+            let client = client(peer);
+            let cancel = CancellationToken::new();
+            let token = crate::SessionCredential::Bearer(Zeroizing::new("a".repeat(43)));
+            let principal = nddev_device_sync_domain::UserId::new("initiating-principal").unwrap();
+            let device = nddev_device_sync_domain::DeviceId::new("own-device").unwrap();
+            tokio::join!(
+                client.device_policy_exchange(
+                    &token,
+                    &principal,
+                    &device,
+                    update.as_ref(),
+                    &cancel
+                ),
+                async {
+                    let request = peer.requested().await;
+                    peer.replies.send(reply).unwrap();
+                    request
+                }
+            )
+        }
+
+        #[tokio::test]
+        async fn device_policy_binds_the_original_principal_and_own_device() {
+            let peer = Peer::new(1);
+            let (result, request) = exchange(
+                &peer,
+                None,
+                (
+                    200,
+                    policy_reply(
+                        "initiating-principal",
+                        "own-device",
+                        serde_json::json!(["dev-desktop", "desktop"]),
+                    ),
+                ),
+            )
+            .await;
+            assert!(request.starts_with("GET /v3/personal/devices/own-device/policy"));
+            let policy = result.unwrap();
+            assert_eq!(policy.mode(), ControlMode::Fullauto);
+            assert_eq!(policy.revision(), 3);
+            assert_eq!(
+                policy.purposes(),
+                &BTreeSet::from([DevicePurpose::DevDesktop, DevicePurpose::Desktop])
+            );
+            for reply in [
+                policy_reply(
+                    "another-principal",
+                    "own-device",
+                    serde_json::json!(["desktop"]),
+                ),
+                policy_reply(
+                    "initiating-principal",
+                    "another-device",
+                    serde_json::json!(["desktop"]),
+                ),
+                policy_reply(
+                    "initiating-principal",
+                    "own-device",
+                    serde_json::json!(["desktop", "desktop"]),
+                ),
+                policy_reply("initiating-principal", "own-device", serde_json::json!([])),
+            ] {
+                let peer = Peer::new(1);
+                assert!(matches!(
+                    exchange(&peer, None, (200, reply)).await.0,
+                    Err(ClientError::InvalidResponse)
+                ));
+            }
+        }
+
+        #[tokio::test]
+        async fn device_policy_refusals_stay_typed_and_older_servers_are_explicit() {
+            let update = personal::DevicePolicyUpdate {
+                expected_revision: 2,
+                mode: personal::ControlMode::Fullauto,
+                purposes: vec![personal::DevicePurpose::Desktop],
+            };
+            for (status, code) in [
+                (409, "operation_conflict"),
+                (403, "recent_authentication_required"),
+                (400, "invalid_request"),
+            ] {
+                let peer = Peer::new(1);
+                let (result, request) = exchange(
+                    &peer,
+                    Some(update.clone()),
+                    (status, serde_json::json!({"error": code})),
+                )
+                .await;
+                assert!(request.starts_with("PUT /v3/personal/devices/own-device/policy"));
+                assert!(matches!(result, Err(ClientError::Server(value)) if value == code));
+            }
+            let peer = Peer::new(1);
+            let (result, _) =
+                exchange(&peer, None, (404, serde_json::json!({"error":"absent"}))).await;
+            assert!(
+                matches!(result, Err(ClientError::Server(value)) if value == "device_policy_unavailable")
+            );
         }
 
         #[tokio::test]
