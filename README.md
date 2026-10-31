@@ -148,14 +148,16 @@ reports the browser's last payload-write readiness separately from transport
 policy and acknowledgements. A readable store does not prove quota recovery.
 Scope changes stop the sender before old queued data can acquire another owner.
 
-`screen` is the Rust-only RDS control boundary. It acquires a separate protected
+`screen` is the Rust-only remote-screen control boundary for the remote module. It acquires a separate protected
 purpose key and endpoint ownership lease, leaving ordinary identity operations
 available. The stable key survives logout; local cancellation, revalidation,
 logout or client destruction clears the owned RAM key. The opaque owner retains
 its exclusive purpose lease while native teardown may still hold a copied key;
 the caller drops that owner only after the endpoint and copied material close. `LocalUseFence` guards key acquisition and the seven signed control
-calls before and after I/O; capture, media and presentation remain with RDS and
-the existing client composition.
+calls before and after I/O; capture, media and presentation remain with the remote module and
+the existing client composition. The `/v2/rds` paths, the keyring service
+`ai.nddev.nds.rds.v1` and the `rds.v1` seed label are frozen legacy identifiers:
+existing endpoint identities and stored purpose keys never change.
 
 Each endpoint instance receives one UUID. Binding retries retain that UUID,
 key and original base revision while refreshing the exact HTTP nonce/expiry and

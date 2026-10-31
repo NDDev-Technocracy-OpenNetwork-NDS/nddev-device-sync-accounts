@@ -1,5 +1,6 @@
 //! Rust-only protected endpoint keys and canonical screen control calls.
-//! Native RDS owns endpoint/media I/O and grant verification; metadata is not consent.
+//! The native remote module owns endpoint/media I/O and grant verification;
+//! metadata is not consent.
 use crate::{ClientError, IdentityClient, LocalUseFence, State, screen_wire as dto};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -272,7 +273,7 @@ impl IdentityClient {
             DeviceId::new(view.current_device_id).map_err(|_| ClientError::RevalidationRequired)?;
         let store = self
             .store
-            .rds_store(&view.tenant_id, &view.user_id, device.as_str());
+            .remote_store(&view.tenant_id, &view.user_id, device.as_str());
         let lease = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ClientError::Cancelled),
