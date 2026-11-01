@@ -139,7 +139,8 @@ pub enum ExportPolicy {
     Enabled,
     Disabled,
 }
-/// The device's effective collection policy as the server last stated it. `Debug` is always
+/// The device's effective collection policy as the server last stated it. Named apart from
+/// the protocol's `CollectionMode` so bindings generated from this view never confuse them. `Debug` is always
 /// finite: `DeliveryView::debug_expires_at` carries its end. The host that owns the local
 /// telemetry controller opens or closes its own debug window from it.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -151,7 +152,7 @@ pub enum ExportPolicy {
     all(target_arch = "wasm32", feature = "browser-bindings"),
     tsify(large_number_types_as_bigints, missing_as_null)
 )]
-pub enum CollectionMode {
+pub enum DeliveryCollection {
     #[default]
     Unknown,
     Standard,
@@ -172,7 +173,7 @@ pub struct DeliveryView {
     /// Browser durable-spool availability; native transport does not use it.
     pub local_persistence_ready: Option<bool>,
     pub policy: ExportPolicy,
-    pub collection: CollectionMode,
+    pub collection: DeliveryCollection,
     /// Unix seconds when the debug collection window ends; 0 outside debug.
     pub debug_expires_at: u64,
     pub paused: bool,
