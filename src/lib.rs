@@ -48,6 +48,19 @@ use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BODY: usize = 65_536;
+/// A diagnostic search page holds at most 200 fixed records; every other reply stays within
+/// [`MAX_BODY`]. The browser bridge keeps its own 64 KiB bound, so browser callers request
+/// smaller pages.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SEARCH_REPLY: usize = 1_048_576;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn reply_limit(path: &str) -> usize {
+    if path == "/v2/observability/search" {
+        MAX_SEARCH_REPLY
+    } else {
+        MAX_BODY
+    }
+}
 
 /// Transport credential ownership is explicit. Browser code cannot substitute
 /// a made-up bearer value for the HttpOnly cookie owned by the browser.
@@ -1045,6 +1058,7 @@ impl IdentityClient {
         let personal_inventory =
             method == Method::GET && path.split('?').next() == Some("/v3/personal/devices");
         let device_policy = path.starts_with("/v3/personal/devices/") && path.ends_with("/policy");
+        let collection_policy = path == "/v2/observability/collection-policy";
         let span = if path.starts_with("/v2/observability/") {
             tracing::Span::none()
         } else {
@@ -1087,6 +1101,11 @@ impl IdentityClient {
                 }
                 if personal_inventory && status == StatusCode::NOT_FOUND {
                     return Err(ClientError::Server("personal_context_unavailable".into()));
+                }
+                // An older server has no collection policy route; delivery falls back to the
+                // export-only client policy instead of guessing a collection mode.
+                if collection_policy && status == StatusCode::NOT_FOUND {
+                    return Err(ClientError::Server("collection_policy_unavailable".into()));
                 }
                 // An older server has no policy route; never guess a mode.
                 if device_policy && status == StatusCode::NOT_FOUND {
