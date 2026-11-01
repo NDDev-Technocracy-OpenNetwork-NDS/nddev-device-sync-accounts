@@ -271,3 +271,46 @@ fn v3_original_receipt_and_encoded_page_limits_do_not_raise_the_transport_budget
         validate_v3_reply_size("/v2/observability/events", StatusCode::OK, crate::MAX_BODY).is_ok()
     );
 }
+
+#[test]
+fn diagnostic_requests_use_fixed_routes_and_bounded_bodies() {
+    use http::Method;
+    let (method, path, body) = SyncRequest::CollectionPolicy.prepare().unwrap();
+    assert_eq!(
+        (method, path.as_str(), body),
+        (Method::GET, "/v2/observability/collection-policy", None)
+    );
+    let (method, path, body) = SyncRequest::GlobalDiagnosticChallenge.prepare().unwrap();
+    assert_eq!(
+        (method, path.as_str(), body),
+        (Method::POST, "/v2/observability/global-challenge", None)
+    );
+    let (method, path, _) = SyncRequest::DiagnosticSearch(b"{}".to_vec())
+        .prepare()
+        .unwrap();
+    assert_eq!(
+        (method, path.as_str()),
+        (Method::POST, "/v2/observability/search")
+    );
+    let (method, path, _) = SyncRequest::GlobalDiagnosticGrant(b"{}".to_vec())
+        .prepare()
+        .unwrap();
+    assert_eq!(
+        (method, path.as_str()),
+        (Method::POST, "/v2/observability/global-grant")
+    );
+    for request in [
+        SyncRequest::DiagnosticSearch(Vec::new()),
+        SyncRequest::DiagnosticSearch(vec![b' '; 8193]),
+        SyncRequest::GlobalDiagnosticGrant(Vec::new()),
+        SyncRequest::GlobalDiagnosticGrant(vec![b' '; 4097]),
+    ] {
+        assert!(matches!(request.prepare(), Err(ClientError::InvalidInput)));
+    }
+    // Only a search page may exceed the ordinary reply bound.
+    assert_eq!(crate::reply_limit("/v2/observability/search"), 1_048_576);
+    assert_eq!(
+        crate::reply_limit("/v2/observability/collection-policy"),
+        65_536
+    );
+}

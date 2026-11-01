@@ -13,7 +13,77 @@ use std::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::view::{DeliveryView, ExportPolicy};
+pub use crate::view::{CollectionMode, DeliveryView, ExportPolicy};
+
+/// One validated effective policy: its mode and, for debug, the unix second it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Effective {
+    pub mode: CollectionMode,
+    pub debug_expires_at: u64,
+}
+/// Validates a stated collection policy: debug always carries a future end, other modes none.
+pub(crate) fn effective(
+    policy: &wire::CollectionPolicy,
+    now: u64,
+) -> Result<Effective, ClientError> {
+    let expires = policy
+        .debug_expires_at
+        .as_deref()
+        .map(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .and_then(|time| u64::try_from(time.unix_timestamp()).ok())
+                .ok_or(ClientError::InvalidResponse)
+        })
+        .transpose()?;
+    match (&policy.mode, expires) {
+        (wire::CollectionMode::Standard, None) => Ok(Effective {
+            mode: CollectionMode::Standard,
+            debug_expires_at: 0,
+        }),
+        (wire::CollectionMode::Off, None) => Ok(Effective {
+            mode: CollectionMode::Off,
+            debug_expires_at: 0,
+        }),
+        // An expired window is standard: debug never outlives its stated end.
+        (wire::CollectionMode::Debug, Some(end)) if end <= now => Ok(Effective {
+            mode: CollectionMode::Standard,
+            debug_expires_at: 0,
+        }),
+        (wire::CollectionMode::Debug, Some(end)) => Ok(Effective {
+            mode: CollectionMode::Debug,
+            debug_expires_at: end,
+        }),
+        _ => Err(ClientError::InvalidResponse),
+    }
+}
+/// The effective policy from the server. An older server without the collection route answers
+/// with the export-only client policy, read as standard (enabled) or off (disabled).
+async fn discover(identity: &IdentityClient) -> Result<Effective, ClientError> {
+    let now = time::OffsetDateTime::now_utc()
+        .unix_timestamp()
+        .try_into()
+        .unwrap_or_default();
+    match identity.sync_request(SyncRequest::CollectionPolicy).await {
+        Ok(reply) => serde_json::from_slice::<wire::CollectionPolicy>(&reply.body)
+            .map_err(|_| ClientError::InvalidResponse)
+            .and_then(|policy| effective(&policy, now)),
+        Err(ClientError::Server(code)) if code == "collection_policy_unavailable" => {
+            let reply = identity.sync_request(SyncRequest::TelemetryPolicy).await?;
+            let legacy = serde_json::from_slice::<wire::ClientTelemetryPolicy>(&reply.body)
+                .map_err(|_| ClientError::InvalidResponse)?;
+            Ok(Effective {
+                mode: if matches!(legacy.export_mode, wire::ExportMode::Enabled) {
+                    CollectionMode::Standard
+                } else {
+                    CollectionMode::Off
+                },
+                debug_expires_at: 0,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
 pub struct Delivery {
     source: Arc<Source>,
     state: Arc<Mutex<DeliveryView>>,
@@ -219,24 +289,27 @@ async fn run(
             let result = tokio::select! {
                 _ = cancel.cancelled() => break,
                 changed = active.changed() => { if changed.is_err() { break; } Batch::park(&mut pending); checked = None; continue; },
-                result = identity.sync_request(SyncRequest::TelemetryPolicy) => result,
-            }.and_then(|reply| serde_json::from_slice::<wire::ClientTelemetryPolicy>(&reply.body).map_err(|_| ClientError::InvalidResponse));
+                result = discover(&identity) => result,
+            };
             match result {
-                Ok(status) => {
-                    let enabled = matches!(status.export_mode, wire::ExportMode::Enabled);
+                Ok(policy) => {
+                    // Off collects and exports nothing new and keeps no hidden stream.
+                    let enabled = policy.mode != CollectionMode::Off;
                     if source.set_enabled(enabled).await.is_err() {
                         record_failure(&state);
                         delay = Duration::from_secs(5);
                         continue;
                     }
-                    state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .policy = if enabled {
-                        ExportPolicy::Enabled
-                    } else {
-                        ExportPolicy::Disabled
-                    };
+                    {
+                        let mut view = state.lock().unwrap_or_else(|error| error.into_inner());
+                        view.policy = if enabled {
+                            ExportPolicy::Enabled
+                        } else {
+                            ExportPolicy::Disabled
+                        };
+                        view.collection = policy.mode;
+                        view.debug_expires_at = policy.debug_expires_at;
+                    }
                     if !enabled {
                         pending = None;
                     }
@@ -250,6 +323,8 @@ async fn run(
                 Err(_) => {
                     let mut view = state.lock().unwrap_or_else(|error| error.into_inner());
                     view.policy = ExportPolicy::Unknown;
+                    view.collection = CollectionMode::Unknown;
+                    view.debug_expires_at = 0;
                     view.failures = view.failures.saturating_add(1);
                     delay = Duration::from_secs(5);
                     continue;
@@ -340,3 +415,57 @@ async fn run(
 
 #[cfg(all(test, feature = "development-http"))]
 mod acceptance;
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn policy(mode: wire::CollectionMode, expires: Option<&str>) -> wire::CollectionPolicy {
+        wire::CollectionPolicy {
+            mode,
+            debug_expires_at: expires.map(str::to_owned),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn debug_is_finite_and_every_other_mode_carries_no_expiry() {
+        let now = 1_793_500_000; // 2026-11-01T02:26:40Z
+        assert_eq!(
+            effective(
+                &policy(wire::CollectionMode::Debug, Some("2026-11-01T06:00:00Z")),
+                now
+            ),
+            Ok(Effective {
+                mode: CollectionMode::Debug,
+                debug_expires_at: 1_793_512_800
+            })
+        );
+        // A window that already ended is standard; debug never outlives its end.
+        assert_eq!(
+            effective(
+                &policy(wire::CollectionMode::Debug, Some("2026-11-01T00:00:00Z")),
+                now
+            )
+            .map(|e| e.mode),
+            Ok(CollectionMode::Standard)
+        );
+        assert_eq!(
+            effective(&policy(wire::CollectionMode::Off, None), now).map(|e| e.mode),
+            Ok(CollectionMode::Off)
+        );
+        assert_eq!(
+            effective(&policy(wire::CollectionMode::Standard, None), now).map(|e| e.mode),
+            Ok(CollectionMode::Standard)
+        );
+        // Contradictory statements are refused, never guessed.
+        for (mode, expires) in [
+            (wire::CollectionMode::Debug, None),
+            (wire::CollectionMode::Standard, Some("2026-11-01T06:00:00Z")),
+            (wire::CollectionMode::Off, Some("2026-11-01T06:00:00Z")),
+            (wire::CollectionMode::Debug, Some("tomorrow")),
+        ] {
+            assert!(effective(&policy(mode, expires), now).is_err());
+        }
+    }
+}
