@@ -13,12 +13,12 @@ use std::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::view::{CollectionMode, DeliveryView, ExportPolicy};
+pub use crate::view::{DeliveryCollection, DeliveryView, ExportPolicy};
 
 /// One validated effective policy: its mode and, for debug, the unix second it ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Effective {
-    pub mode: CollectionMode,
+    pub mode: DeliveryCollection,
     pub debug_expires_at: u64,
 }
 /// Validates a stated collection policy: debug always carries a future end, other modes none.
@@ -38,20 +38,20 @@ pub(crate) fn effective(
         .transpose()?;
     match (&policy.mode, expires) {
         (wire::CollectionMode::Standard, None) => Ok(Effective {
-            mode: CollectionMode::Standard,
+            mode: DeliveryCollection::Standard,
             debug_expires_at: 0,
         }),
         (wire::CollectionMode::Off, None) => Ok(Effective {
-            mode: CollectionMode::Off,
+            mode: DeliveryCollection::Off,
             debug_expires_at: 0,
         }),
         // An expired window is standard: debug never outlives its stated end.
         (wire::CollectionMode::Debug, Some(end)) if end <= now => Ok(Effective {
-            mode: CollectionMode::Standard,
+            mode: DeliveryCollection::Standard,
             debug_expires_at: 0,
         }),
         (wire::CollectionMode::Debug, Some(end)) => Ok(Effective {
-            mode: CollectionMode::Debug,
+            mode: DeliveryCollection::Debug,
             debug_expires_at: end,
         }),
         _ => Err(ClientError::InvalidResponse),
@@ -74,9 +74,9 @@ async fn discover(identity: &IdentityClient) -> Result<Effective, ClientError> {
                 .map_err(|_| ClientError::InvalidResponse)?;
             Ok(Effective {
                 mode: if matches!(legacy.export_mode, wire::ExportMode::Enabled) {
-                    CollectionMode::Standard
+                    DeliveryCollection::Standard
                 } else {
-                    CollectionMode::Off
+                    DeliveryCollection::Off
                 },
                 debug_expires_at: 0,
             })
@@ -294,7 +294,7 @@ async fn run(
             match result {
                 Ok(policy) => {
                     // Off collects and exports nothing new and keeps no hidden stream.
-                    let enabled = policy.mode != CollectionMode::Off;
+                    let enabled = policy.mode != DeliveryCollection::Off;
                     if source.set_enabled(enabled).await.is_err() {
                         record_failure(&state);
                         delay = Duration::from_secs(5);
@@ -323,7 +323,7 @@ async fn run(
                 Err(_) => {
                     let mut view = state.lock().unwrap_or_else(|error| error.into_inner());
                     view.policy = ExportPolicy::Unknown;
-                    view.collection = CollectionMode::Unknown;
+                    view.collection = DeliveryCollection::Unknown;
                     view.debug_expires_at = 0;
                     view.failures = view.failures.saturating_add(1);
                     delay = Duration::from_secs(5);
@@ -437,7 +437,7 @@ mod policy_tests {
                 now
             ),
             Ok(Effective {
-                mode: CollectionMode::Debug,
+                mode: DeliveryCollection::Debug,
                 debug_expires_at: 1_793_512_800
             })
         );
@@ -448,15 +448,15 @@ mod policy_tests {
                 now
             )
             .map(|e| e.mode),
-            Ok(CollectionMode::Standard)
+            Ok(DeliveryCollection::Standard)
         );
         assert_eq!(
             effective(&policy(wire::CollectionMode::Off, None), now).map(|e| e.mode),
-            Ok(CollectionMode::Off)
+            Ok(DeliveryCollection::Off)
         );
         assert_eq!(
             effective(&policy(wire::CollectionMode::Standard, None), now).map(|e| e.mode),
-            Ok(CollectionMode::Standard)
+            Ok(DeliveryCollection::Standard)
         );
         // Contradictory statements are refused, never guessed.
         for (mode, expires) in [
