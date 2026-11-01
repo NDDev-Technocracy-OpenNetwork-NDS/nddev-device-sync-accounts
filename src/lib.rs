@@ -1140,6 +1140,8 @@ impl IdentityClient {
                 } else if personal_inventory {
                     let response: personal_wire::Error = decode(&bytes)?;
                     serde_json::to_value(response.error)
+                } else if path.starts_with("/v2/observability/") {
+                    observability_error_code(&bytes)
                 } else {
                     let response: wire::Error = decode(&bytes)?;
                     serde_json::to_value(response.error)
@@ -1288,6 +1290,19 @@ fn clear_flow_state(state: &mut State) {
     state.view.verification_code.clear();
     state.view.expires_in_seconds = 0;
     state.view.retry_after_seconds = 0;
+}
+
+/// Observability routes answer authentication refusals with the control-plane error and
+/// their own refusals (`forbidden_scope`, `global_grant_required`, ...) with the
+/// observability error; either is a typed server code, never an invalid response.
+fn observability_error_code(body: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
+    match decode::<wire::Error>(body) {
+        Ok(response) => serde_json::to_value(response.error),
+        Err(_) => match decode::<observability_wire::ObservabilityError>(body) {
+            Ok(response) => serde_json::to_value(response.error),
+            Err(_) => Ok(serde_json::Value::Null),
+        },
+    }
 }
 
 fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
@@ -1683,5 +1698,34 @@ mod passkey_selector_tests {
             assert!(passkey_request(false, Some(value.into())).is_err());
         }
         assert!(passkey_request(true, Some("other@example.invalid".into())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observability_error_tests {
+    use super::observability_error_code;
+
+    #[test]
+    fn observability_refusals_keep_their_codes() {
+        for code in [
+            "forbidden_scope",
+            "global_grant_required",
+            "dependency_unavailable",
+        ] {
+            let body = format!(r#"{{"error":"{code}"}}"#);
+            assert_eq!(observability_error_code(body.as_bytes()).unwrap(), code);
+        }
+        // The control-plane authentication refusal on the same routes stays typed too.
+        assert_eq!(
+            observability_error_code(br#"{"error":"authentication_failed"}"#).unwrap(),
+            "authentication_failed"
+        );
+        // Anything else is still an invalid response for the caller.
+        assert!(
+            observability_error_code(br#"{"error":"made_up"}"#)
+                .unwrap()
+                .is_null()
+        );
+        assert!(observability_error_code(b"not json").unwrap().is_null());
     }
 }
