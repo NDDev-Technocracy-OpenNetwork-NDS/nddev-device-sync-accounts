@@ -48,6 +48,19 @@ use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BODY: usize = 65_536;
+/// A diagnostic search page holds at most 200 fixed records; every other reply stays within
+/// [`MAX_BODY`]. The browser bridge keeps its own 64 KiB bound, so browser callers request
+/// smaller pages.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SEARCH_REPLY: usize = 1_048_576;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn reply_limit(path: &str) -> usize {
+    if path == "/v2/observability/search" {
+        MAX_SEARCH_REPLY
+    } else {
+        MAX_BODY
+    }
+}
 
 /// Transport credential ownership is explicit. Browser code cannot substitute
 /// a made-up bearer value for the HttpOnly cookie owned by the browser.
@@ -1045,6 +1058,7 @@ impl IdentityClient {
         let personal_inventory =
             method == Method::GET && path.split('?').next() == Some("/v3/personal/devices");
         let device_policy = path.starts_with("/v3/personal/devices/") && path.ends_with("/policy");
+        let collection_policy = path == "/v2/observability/collection-policy";
         let span = if path.starts_with("/v2/observability/") {
             tracing::Span::none()
         } else {
@@ -1088,6 +1102,11 @@ impl IdentityClient {
                 if personal_inventory && status == StatusCode::NOT_FOUND {
                     return Err(ClientError::Server("personal_context_unavailable".into()));
                 }
+                // An older server has no collection policy route; delivery falls back to the
+                // export-only client policy instead of guessing a collection mode.
+                if collection_policy && status == StatusCode::NOT_FOUND {
+                    return Err(ClientError::Server("collection_policy_unavailable".into()));
+                }
                 // An older server has no policy route; never guess a mode.
                 if device_policy && status == StatusCode::NOT_FOUND {
                     return Err(ClientError::Server("device_policy_unavailable".into()));
@@ -1121,6 +1140,8 @@ impl IdentityClient {
                 } else if personal_inventory {
                     let response: personal_wire::Error = decode(&bytes)?;
                     serde_json::to_value(response.error)
+                } else if path.starts_with("/v2/observability/") {
+                    observability_error_code(&bytes)
                 } else {
                     let response: wire::Error = decode(&bytes)?;
                     serde_json::to_value(response.error)
@@ -1269,6 +1290,19 @@ fn clear_flow_state(state: &mut State) {
     state.view.verification_code.clear();
     state.view.expires_in_seconds = 0;
     state.view.retry_after_seconds = 0;
+}
+
+/// Observability routes answer authentication refusals with the control-plane error and
+/// their own refusals (`forbidden_scope`, `global_grant_required`, ...) with the
+/// observability error; either is a typed server code, never an invalid response.
+fn observability_error_code(body: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
+    match decode::<wire::Error>(body) {
+        Ok(response) => serde_json::to_value(response.error),
+        Err(_) => match decode::<observability_wire::ObservabilityError>(body) {
+            Ok(response) => serde_json::to_value(response.error),
+            Err(_) => Ok(serde_json::Value::Null),
+        },
+    }
 }
 
 fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, ClientError> {
@@ -1664,5 +1698,34 @@ mod passkey_selector_tests {
             assert!(passkey_request(false, Some(value.into())).is_err());
         }
         assert!(passkey_request(true, Some("other@example.invalid".into())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observability_error_tests {
+    use super::observability_error_code;
+
+    #[test]
+    fn observability_refusals_keep_their_codes() {
+        for code in [
+            "forbidden_scope",
+            "global_grant_required",
+            "dependency_unavailable",
+        ] {
+            let body = format!(r#"{{"error":"{code}"}}"#);
+            assert_eq!(observability_error_code(body.as_bytes()).unwrap(), code);
+        }
+        // The control-plane authentication refusal on the same routes stays typed too.
+        assert_eq!(
+            observability_error_code(br#"{"error":"authentication_failed"}"#).unwrap(),
+            "authentication_failed"
+        );
+        // Anything else is still an invalid response for the caller.
+        assert!(
+            observability_error_code(br#"{"error":"made_up"}"#)
+                .unwrap()
+                .is_null()
+        );
+        assert!(observability_error_code(b"not json").unwrap().is_null());
     }
 }

@@ -2,7 +2,7 @@
 //! shared identity client; neither adapter exposes a general authenticated proxy.
 use crate::{ClientError, IdentityClient, WireRequest};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{MAX_BODY, SessionCredential};
+use crate::{SessionCredential, reply_limit};
 use http::StatusCode;
 use std::collections::HashMap;
 #[cfg(target_arch = "wasm32")]
@@ -69,15 +69,13 @@ impl IdentityClient {
                 }
             })?;
             let status = response.status();
-            if response
-                .content_length()
-                .is_some_and(|n| n > MAX_BODY as u64)
-            {
+            let limit = reply_limit(path);
+            if response.content_length().is_some_and(|n| n > limit as u64) {
                 return Err(ClientError::InvalidResponse);
             }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| ClientError::Transport)? {
-                if bytes.len() + chunk.len() > MAX_BODY {
+                if bytes.len() + chunk.len() > limit {
                     return Err(ClientError::InvalidResponse);
                 }
                 bytes.extend_from_slice(&chunk);

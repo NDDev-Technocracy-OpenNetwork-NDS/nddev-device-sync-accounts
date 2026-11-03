@@ -47,6 +47,14 @@ pub enum SyncRequest {
     NativeTraces(Vec<u8>),
     /// Export policy for any active client; no global operator data.
     TelemetryPolicy,
+    /// The one effective collection policy (standard, finite debug or off) of this device.
+    CollectionPolicy,
+    /// Scoped diagnostic search; the server derives identity and rights from the signature.
+    DiagnosticSearch(Vec<u8>),
+    /// One-time challenge for the global diagnostic administrator key.
+    GlobalDiagnosticChallenge,
+    /// SSHSIG proof over that challenge; opens global scope for this session and device.
+    GlobalDiagnosticGrant(Vec<u8>),
     ObservabilityStatus,
     Incidents {
         after: String,
@@ -86,6 +94,32 @@ impl SyncRequest {
             }
             SyncRequest::TelemetryPolicy => {
                 Ok((Method::GET, "/v2/observability/client-policy".into(), None))
+            }
+            SyncRequest::CollectionPolicy => Ok((
+                Method::GET,
+                "/v2/observability/collection-policy".into(),
+                None,
+            )),
+            SyncRequest::DiagnosticSearch(body) => {
+                if body.is_empty() || body.len() > 8192 {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((Method::POST, "/v2/observability/search".into(), Some(body)))
+            }
+            SyncRequest::GlobalDiagnosticChallenge => Ok((
+                Method::POST,
+                "/v2/observability/global-challenge".into(),
+                None,
+            )),
+            SyncRequest::GlobalDiagnosticGrant(body) => {
+                if body.is_empty() || body.len() > 4096 {
+                    return Err(ClientError::InvalidInput);
+                }
+                Ok((
+                    Method::POST,
+                    "/v2/observability/global-grant".into(),
+                    Some(body),
+                ))
             }
             SyncRequest::ObservabilityStatus => {
                 Ok((Method::GET, "/v2/observability/status".into(), None))
@@ -386,6 +420,7 @@ impl IdentityClient {
             SyncRequest::Telemetry(_)
                 | SyncRequest::NativeTraces(_)
                 | SyncRequest::TelemetryPolicy
+                | SyncRequest::CollectionPolicy
                 | SyncRequest::ObservabilityStatus
                 | SyncRequest::Incidents { .. }
                 | SyncRequest::IncidentAction { .. }
