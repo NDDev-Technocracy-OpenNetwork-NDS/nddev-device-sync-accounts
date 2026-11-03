@@ -309,6 +309,18 @@ impl Source {
                 if cancel.is_cancelled() {
                     break;
                 }
+                // Sparse producer bursts get a bounded opportunity to share
+                // a durable batch instead of spending one signed request per
+                // record. Busy feeds drain immediately. The SDK still owns
+                // byte/count bounds and original creation/expiry timestamps.
+                let events = source.events.health().pending;
+                let traces = source.traces.health().pending;
+                if (events > 0 || traces > 0) && events < 16 && traces < 16 {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = runtime::sleep(Duration::from_millis(50)) => {}
+                    }
+                }
                 let mut work = false;
                 let mut failed = false;
                 for (feed, trace) in [(&source.events, false), (&source.traces, true)] {
