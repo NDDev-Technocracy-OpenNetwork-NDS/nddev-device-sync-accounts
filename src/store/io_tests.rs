@@ -253,3 +253,50 @@ async fn io_waiting_budget_is_bounded_and_cancelled_requests_release_capacity() 
     drop(permit);
     drop(store.admit_io(&span).await.unwrap());
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn delivery_admission_io_remains_outside_the_trace_export_feed() {
+    use nddev_device_sync_telemetry::{Config, client_traces::ClientTraces};
+    use tracing::Instrument;
+    use tracing::instrument::WithSubscriber;
+    let config = Config {
+        service: "nds-delivery-io-regression".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts".into(),
+        commit: "unknown".into(),
+        channel: "alpha".into(),
+        standards: "unreleased".into(),
+        environment: "test".into(),
+        target_prefixes: vec!["nds_accounts".into()],
+        default_module: "process".into(),
+        debug: None,
+    };
+    let traces = ClientTraces::new(&config).unwrap();
+    let feed = traces.subscribe().unwrap();
+    let (subscriber, control) =
+        nddev_device_sync_telemetry::subscriber(config, std::io::sink(), traces.tracer()).unwrap();
+    async {
+        let store = SessionStore::for_endpoint(&format!(
+            "https://nds-delivery-{}.invalid",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        for _ in 0..10 {
+            let span = nddev_device_sync_telemetry::delivery_span();
+            store
+                .run_io("identity.operation.admitted", |_, _| Ok(()))
+                .instrument(span)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            feed.health().pending,
+            0,
+            "delivery credential admission created recursive spans"
+        );
+        assert_eq!(control.rejected_fields_or_events(), 0);
+    }
+    .with_subscriber(subscriber)
+    .await;
+}
