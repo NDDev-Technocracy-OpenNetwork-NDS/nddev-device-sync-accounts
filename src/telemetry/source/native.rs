@@ -17,6 +17,8 @@ pub(super) struct State {
     observed: bool,
     io_failures: u64,
     fallback: VecDeque<(ExportBatch, bool)>,
+    loss_pending: [u64; 6],
+    loss_reported_at: Option<std::time::Instant>,
 }
 pub(super) enum Payload {
     Memory(ExportBatch, bool),
@@ -56,7 +58,7 @@ impl Payload {
     pub async fn acknowledge(&mut self, source: &Source, accepted: i64) -> Result<(), ()> {
         match self {
             Self::Memory(b, _) => b.acknowledge_count(accepted).map_err(|_| ()),
-            Self::Stored(b, q) => source.remember_native(q.finish(b, Some(accepted)).await, false),
+            Self::Stored(b, q) => source.remember_native(q.finish(b, Some(accepted)).await, None),
         }
     }
     pub async fn failed(&self, source: &Source) -> Result<(), ()> {
@@ -65,13 +67,13 @@ impl Payload {
                 b.failed();
                 Ok(())
             }
-            Self::Stored(b, q) => source.remember_native(q.failed(b).await, false),
+            Self::Stored(b, q) => source.remember_native(q.failed(b).await, None),
         }
     }
     pub async fn discard(self, source: &Source) -> Result<(), ()> {
         match self {
             Self::Memory(..) => Ok(()),
-            Self::Stored(b, q) => source.remember_native(q.finish(&b, None).await, false),
+            Self::Stored(b, q) => source.remember_native(q.finish(&b, None).await, None),
         }
     }
 }
@@ -103,9 +105,15 @@ impl Source {
             .queue
             .clone()
     }
-    fn remember_native(&self, result: Result<disk::Health, ()>, write: bool) -> Result<(), ()> {
+    fn remember_native(
+        &self,
+        result: Result<disk::Health, ()>,
+        write: Option<u64>,
+    ) -> Result<(), ()> {
         let mut state = self.native.lock().unwrap_or_else(|e| e.into_inner());
         let mut transition = None;
+        let mut reports = [0; 6];
+        let mut restored = false;
         let result = match result {
             Ok(health) => {
                 if state
@@ -113,9 +121,34 @@ impl Source {
                     .as_ref()
                     .is_none_or(|old| old.revision <= health.revision)
                 {
+                    if let Some(previous) = &state.health {
+                        let delta = std::array::from_fn::<_, 6, _>(|i| {
+                            health.losses[i].saturating_sub(previous.losses[i])
+                        });
+                        for (pending, count) in state.loss_pending.iter_mut().zip(delta) {
+                            *pending = add(*pending, count);
+                        }
+                    } else {
+                        reports = health.losses;
+                        restored = true;
+                    }
                     state.health = Some(health);
                 }
-                if write {
+                if state
+                    .loss_reported_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
+                {
+                    for (report, pending) in reports.iter_mut().zip(state.loss_pending.iter_mut()) {
+                        *report = add(*report, *pending);
+                        *pending = 0;
+                    }
+                    if reports.iter().any(|n| *n != 0) {
+                        state.loss_reported_at = Some(std::time::Instant::now());
+                    }
+                }
+                if write
+                    .is_some_and(|epoch| epoch == state.io_failures && epoch < super::MAX_COUNTER)
+                {
                     if !state.observed || !state.ready {
                         transition = Some(true);
                     }
@@ -137,6 +170,23 @@ impl Source {
             }
         };
         drop(state);
+        for (class, count) in disk::Loss::ALL.into_iter().zip(reports) {
+            if count == 0 {
+                continue;
+            }
+            let name = if restored {
+                format!("telemetry.spool.restored.{}", class.code())
+            } else {
+                format!("telemetry.spool.{}", class.code())
+            };
+            nddev_device_sync_telemetry::delivery_span().in_scope(|| {
+                if restored {
+                    tracing::event!(target:"nds_accounts",tracing::Level::INFO,{event.name=name.as_str(),module="accounts",scope="io",dropped_count=count,outcome="checked"});
+                } else {
+                    tracing::event!(target:"nds_accounts",tracing::Level::WARN,{event.name=name.as_str(),module="accounts",scope="io",dropped_count=count,outcome="rejected"});
+                }
+            });
+        }
         if let Some(ready) = transition {
             nddev_device_sync_telemetry::delivery_span().in_scope(|| {
                 if ready {
@@ -150,12 +200,12 @@ impl Source {
     }
     pub(super) async fn maintain_native(&self) {
         if let Some(q) = self.native_queue() {
-            let _ = self.remember_native(q.health().await, false);
+            let _ = self.remember_native(q.health().await, None);
         }
     }
     pub(super) async fn enabled_native(&self, enabled: bool) -> Result<(), ()> {
         if let Some(q) = self.native_queue() {
-            self.remember_native(q.enabled(enabled).await, false)?;
+            self.remember_native(q.enabled(enabled).await, None)?;
         }
         Ok(())
     }
@@ -177,7 +227,7 @@ impl Source {
                 }
                 Ok(None) => {}
                 Err(()) => {
-                    let _ = self.remember_native(Err(()), false);
+                    let _ = self.remember_native(Err(()), None);
                 }
             }
         }
@@ -244,7 +294,7 @@ impl Source {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .initialised = true;
-                    let _ = source.remember_native(Err(()), false);
+                    let _ = source.remember_native(Err(()), None);
                     return;
                 }
             };
@@ -260,17 +310,17 @@ impl Source {
                     }
                     if let Some(batch) = feed.take_batch() {
                         work = true;
-                        source
-                            .native
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .writing = true;
+                        let epoch = {
+                            let mut state = source.native.lock().unwrap_or_else(|e| e.into_inner());
+                            state.writing = true;
+                            state.io_failures
+                        };
                         match q.persist(trace, batch).await {
                             Ok((h, written)) => {
-                                let _ = source.remember_native(Ok(h), written);
+                                let _ = source.remember_native(Ok(h), written.then_some(epoch));
                             }
                             Err(batch) => {
-                                let _ = source.remember_native(Err(()), false);
+                                let _ = source.remember_native(Err(()), None);
                                 if let Some(batch) = batch {
                                     source
                                         .native
@@ -298,3 +348,6 @@ impl Source {
         });
     }
 }
+
+#[cfg(test)]
+mod tests;

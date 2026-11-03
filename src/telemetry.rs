@@ -146,7 +146,8 @@ impl Delivery {
         self.task.is_finished()
     }
     /// Try to drain while the process is still running. Returns truthful counters
-    /// after at most five seconds; Drop accounts for any remaining records.
+    /// after at most five seconds. Durable batches remain queued on Drop;
+    /// the SDK accounts for any unstaged RAM records.
     pub async fn flush(&self) -> DeliveryView {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

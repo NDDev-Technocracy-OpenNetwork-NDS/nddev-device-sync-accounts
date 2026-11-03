@@ -19,12 +19,52 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RECORDS: u32 = 4096;
 const MAX_SCOPES: u32 = 16;
 
+#[derive(Clone, Copy)]
+pub(super) enum Loss {
+    Expired,
+    Capacity,
+    Off,
+    RetryLimit,
+    ReceiverRejected,
+    Discarded,
+}
+impl Loss {
+    pub const ALL: [Self; 6] = [
+        Self::Expired,
+        Self::Capacity,
+        Self::Off,
+        Self::RetryLimit,
+        Self::ReceiverRejected,
+        Self::Discarded,
+    ];
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Capacity => "capacity_exhausted",
+            Self::Off => "disabled",
+            Self::RetryLimit => "retry_exhausted",
+            Self::ReceiverRejected => "receiver_rejected",
+            Self::Discarded => "discarded",
+        }
+    }
+    fn column(self) -> &'static str {
+        match self {
+            Self::Expired => "loss_expired",
+            Self::Capacity => "loss_capacity",
+            Self::Off => "loss_off",
+            Self::RetryLimit => "loss_retry",
+            Self::ReceiverRejected => "loss_rejected",
+            Self::Discarded => "loss_discarded",
+        }
+    }
+}
 #[derive(Clone, Default)]
 pub(super) struct Health {
     pub events: FeedHealth,
     pub traces: FeedHealth,
     pub last_success_at: u64,
     pub revision: u64,
+    pub losses: [u64; 6],
 }
 pub(super) struct Batch {
     pub id: i64,
@@ -148,6 +188,12 @@ impl Queue {
                 dropped_traces INTEGER NOT NULL DEFAULT 0 CHECK(dropped_traces BETWEEN 0 AND 9007199254740991),
                 failures_events INTEGER NOT NULL DEFAULT 0 CHECK(failures_events BETWEEN 0 AND 9007199254740991),
                 failures_traces INTEGER NOT NULL DEFAULT 0 CHECK(failures_traces BETWEEN 0 AND 9007199254740991),
+                loss_expired INTEGER NOT NULL DEFAULT 0 CHECK(loss_expired BETWEEN 0 AND 9007199254740991),
+                loss_capacity INTEGER NOT NULL DEFAULT 0 CHECK(loss_capacity BETWEEN 0 AND 9007199254740991),
+                loss_off INTEGER NOT NULL DEFAULT 0 CHECK(loss_off BETWEEN 0 AND 9007199254740991),
+                loss_retry INTEGER NOT NULL DEFAULT 0 CHECK(loss_retry BETWEEN 0 AND 9007199254740991),
+                loss_rejected INTEGER NOT NULL DEFAULT 0 CHECK(loss_rejected BETWEEN 0 AND 9007199254740991),
+                loss_discarded INTEGER NOT NULL DEFAULT 0 CHECK(loss_discarded BETWEEN 0 AND 9007199254740991),
                 last_success INTEGER NOT NULL DEFAULT 0 CHECK(last_success>=0),
                 observed_at INTEGER NOT NULL CHECK(observed_at BETWEEN 0 AND 9007199254740991),
                 revision INTEGER NOT NULL DEFAULT 0 CHECK(revision BETWEEN 0 AND 9007199254740991));
@@ -270,7 +316,7 @@ impl Queue {
         let senders = self.senders.clone();
         self.run(move |db,scope,now| {
             let commit = (|| {
-                let expiry = batch.expires_at_ms().map_err(|_| ())?;
+                let expiry = if batch.expired() { 0 } else { batch.expires_at_ms().map_err(|_| ())? };
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ())?;
                 let leases = expire_other_scopes(&tx, &senders, scope, now)?;
                 expire(&tx,scope,now,false)?;
@@ -280,7 +326,8 @@ impl Queue {
                 if stored {
                     tx.execute("INSERT INTO batches(scope,trace,count,payload,expires) VALUES(?1,?2,?3,?4,?5)",params![scope,trace,batch.count(),batch.bytes(),expiry]).map_err(|_| ())?;
                 } else {
-                    counter(&tx,scope,trace,"dropped",u64::from(batch.count()))?;
+                    let reason = if !enabled {Loss::Off} else if expiry<=now {Loss::Expired} else {Loss::Capacity};
+                    loss(&tx,scope,trace,reason,u64::from(batch.count()))?;
                 }
                 touch(&tx,scope,now)?;
                 tx.commit().map_err(|_| ())?;
@@ -318,7 +365,7 @@ impl Queue {
             if !enabled {
                 for trace in [false,true] {
                     let count: u64=tx.query_row("SELECT coalesce(sum(count),0) FROM batches WHERE scope=?1 AND trace=?2",params![scope,trace],|r|r.get(0)).map_err(|_| ())?;
-                    counter(&tx,scope,trace,"dropped",count)?;
+                    loss(&tx,scope,trace,Loss::Off,count)?;
                 }
                 tx.execute("DELETE FROM batches WHERE scope=?1",[scope]).map_err(|_| ())?;
             }
@@ -343,21 +390,30 @@ impl Queue {
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| ())?;
-            let existing: Option<(bool, u32)> = tx
+            let original: Option<(bool, u32, u64, u32)> = tx
                 .query_row(
-                    "SELECT trace,count FROM batches WHERE id=?1 AND scope=?2",
+                    "SELECT trace,count,expires,attempts FROM batches WHERE id=?1 AND scope=?2",
                     params![id, scope],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()
                 .map_err(|_| ())?;
-            if let Some(original) = existing {
-                if original != (trace, count) {
+            if let Some((original_trace, original_count, expiry, attempts)) = original {
+                if (original_trace, original_count) != (trace, count) {
                     return Err(());
                 }
                 let delivered = accepted.unwrap_or(0) as u64;
                 counter(&tx, scope, trace, "delivered", delivered)?;
-                counter(&tx, scope, trace, "dropped", u64::from(count) - delivered)?;
+                let reason = if accepted.is_some() {
+                    Loss::ReceiverRejected
+                } else if expiry <= now {
+                    Loss::Expired
+                } else if attempts >= 8 {
+                    Loss::RetryLimit
+                } else {
+                    Loss::Discarded
+                };
+                loss(&tx, scope, trace, reason, u64::from(count) - delivered)?;
                 if accepted == Some(i64::from(count)) {
                     tx.execute(
                         "UPDATE scopes SET last_success=?1 WHERE scope=?2",
@@ -372,9 +428,9 @@ impl Queue {
                 .map_err(|_| ())?;
                 touch(&tx, scope, now)?;
             }
-            let h = snapshot(&tx, scope)?;
+            let health = snapshot(&tx, scope)?;
             tx.commit().map_err(|_| ())?;
-            Ok(h)
+            Ok(health)
         })
         .await?
     }
@@ -416,6 +472,16 @@ fn counter(db: &Connection, scope: &str, trace: bool, kind: &str, count: u64) ->
     .map_err(|_| ())?;
     Ok(())
 }
+fn loss(db: &Connection, scope: &str, trace: bool, reason: Loss, count: u64) -> Result<(), ()> {
+    counter(db, scope, trace, "dropped", count)?;
+    let column = reason.column();
+    db.execute(
+        &format!("UPDATE scopes SET {column}=min({column}+?1,9007199254740991) WHERE scope=?2"),
+        params![count, scope],
+    )
+    .map_err(|_| ())?;
+    Ok(())
+}
 fn touch(db: &Connection, scope: &str, now: u64) -> Result<(), ()> {
     let changed=db.execute("UPDATE scopes SET observed_at=max(observed_at,?1),revision=revision+1 WHERE scope=?2 AND revision<9007199254740991",params![now,scope]).map_err(|_| ())?;
     if changed == 1 { Ok(()) } else { Err(()) }
@@ -423,7 +489,7 @@ fn touch(db: &Connection, scope: &str, now: u64) -> Result<(), ()> {
 fn expire(db: &Transaction<'_>, scope: &str, now: u64, include_claimed: bool) -> Result<bool, ()> {
     for trace in [false, true] {
         let count:u64=db.query_row("SELECT coalesce(sum(count),0) FROM batches WHERE scope=?1 AND trace=?2 AND (claimed=0 OR ?4) AND expires<=?3",params![scope,trace,now,include_claimed],|r|r.get(0)).map_err(|_| ())?;
-        counter(db, scope, trace, "dropped", count)?;
+        loss(db, scope, trace, Loss::Expired, count)?;
     }
     let removed = db
         .execute(
@@ -481,7 +547,7 @@ fn expire_other_scopes(
     Ok(leases)
 }
 fn snapshot(db: &Connection, scope: &str) -> Result<Health, ()> {
-    let mut h=db.query_row("SELECT delivered_events,delivered_traces,dropped_events,dropped_traces,failures_events,failures_traces,last_success,revision FROM scopes WHERE scope=?1",[scope],|r|Ok(Health{events:FeedHealth{delivered:r.get(0)?,dropped:r.get(2)?,failures:r.get(4)?,..Default::default()},traces:FeedHealth{delivered:r.get(1)?,dropped:r.get(3)?,failures:r.get(5)?,..Default::default()},last_success_at:r.get(6)?,revision:r.get(7)?})).map_err(|_| ())?;
+    let mut h=db.query_row("SELECT delivered_events,delivered_traces,dropped_events,dropped_traces,failures_events,failures_traces,last_success,revision,loss_expired,loss_capacity,loss_off,loss_retry,loss_rejected,loss_discarded FROM scopes WHERE scope=?1",[scope],|r|Ok(Health{events:FeedHealth{delivered:r.get(0)?,dropped:r.get(2)?,failures:r.get(4)?,..Default::default()},traces:FeedHealth{delivered:r.get(1)?,dropped:r.get(3)?,failures:r.get(5)?,..Default::default()},last_success_at:r.get(6)?,revision:r.get(7)?,losses:[r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?]})).map_err(|_| ())?;
     for trace in [false, true] {
         let count: u32 = db
             .query_row(
@@ -500,4 +566,4 @@ fn snapshot(db: &Connection, scope: &str) -> Result<Health, ()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

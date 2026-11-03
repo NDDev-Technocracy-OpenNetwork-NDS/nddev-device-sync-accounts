@@ -151,7 +151,9 @@ from a failed payload write. Native blocking operations retain the scope lease
 until their real completion, including after async caller cancellation.
 
 A restarted sender reclaims only its original scope, preserving bytes, expiry
-and failed-attempt counts. Known receipts retry local settlement only; partial
+and failed-attempt counts. Expiry, capacity, opt-out, retry exhaustion and receiver
+rejection keep separate durable loss counters; local diagnostic summaries are
+bounded and never recursively enter export. Known receipts retry local settlement only; partial
 trace receipts are terminal and count rejected records as dropped. Unknown
 outcomes may repeat spans, so exactly-once delivery is not claimed. Opt-out
 removes scoped queued payloads, without deleting another scope's records.

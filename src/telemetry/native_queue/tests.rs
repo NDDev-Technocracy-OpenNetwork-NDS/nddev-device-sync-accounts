@@ -17,8 +17,8 @@ impl Drop for Root {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn feed(count: usize) -> ExportFeed {
-    let config = Config {
+pub(in crate::telemetry) fn config() -> Config {
+    Config {
         service: "nddev-device-sync-client".into(),
         version: "0.0.1-alpha.1".into(),
         repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-desktop".into(),
@@ -26,10 +26,13 @@ fn feed(count: usize) -> ExportFeed {
         channel: "alpha".into(),
         standards: "unreleased".into(),
         environment: "test".into(),
-        target_prefixes: vec!["nds_spool_test".into()],
+        target_prefixes: vec!["nds_spool_test".into(), "nds_accounts".into()],
         default_module: "accounts".into(),
         debug: None,
-    };
+    }
+}
+fn feed(count: usize) -> ExportFeed {
+    let config = config();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::default();
     let (subscriber, control) = nddev_device_sync_telemetry::subscriber(
         config,
@@ -98,6 +101,7 @@ async fn partial_trace_receipt_is_terminal_and_off_never_recounts_a_deleted_batc
         ),
         (0, 1, 2, 0)
     );
+    assert_eq!(h.losses, [0, 0, 0, 0, 2, 0]);
     assert!(q.next().await.unwrap().is_none());
     put(&q, false, 2).await;
     let b = q.next().await.unwrap().unwrap();
@@ -455,7 +459,11 @@ async fn hard_kill_releases_sender_and_restart_reads_every_committed_batch() {
 fn crash_child() {
     let root =
         PathBuf::from(std::env::var_os("NDS_SPOOL_CRASH_FIXTURE").expect("owned fixture path"));
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(2)
+        .build()
+        .unwrap();
     runtime.block_on(async move {
         let q = Queue::open(root, "a".repeat(64)).unwrap();
         let feed = feed(96);
