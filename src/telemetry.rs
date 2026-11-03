@@ -3,6 +3,8 @@
 use crate::runtime::{self, Instant, Task};
 use crate::{ClientError, IdentityClient, SyncRequest, observability_wire as wire};
 use nddev_device_sync_telemetry::ExportFeed;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_queue;
 mod receipt;
 mod source;
 use source::{Batch, Source};
@@ -106,8 +108,9 @@ impl Delivery {
         }));
         let (active, receiver) = watch::channel(foreground);
         let cancel = CancellationToken::new();
-        #[cfg(target_arch = "wasm32")]
-        source.start_staging(cancel.clone());
+        if source.matches(&identity) {
+            source.start_staging(cancel.clone());
+        }
         let task = runtime::spawn(run(
             identity,
             source.clone(),
@@ -143,12 +146,17 @@ impl Delivery {
         self.task.is_finished()
     }
     /// Try to drain while the process is still running. Returns truthful counters
-    /// after at most five seconds; Drop accounts for any remaining records.
+    /// after at most five seconds. Durable batches remain queued on Drop;
+    /// the SDK accounts for any unstaged RAM records.
     pub async fn flush(&self) -> DeliveryView {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let view = self.snapshot();
-            if view.pending + view.spans_pending == 0
+            #[cfg(not(target_arch = "wasm32"))]
+            let staging = self.source.native_busy();
+            #[cfg(target_arch = "wasm32")]
+            let staging = false;
+            if view.pending + view.spans_pending == 0 && !staging
                 || !view.initialized
                 || view.paused
                 || Instant::now() >= deadline
