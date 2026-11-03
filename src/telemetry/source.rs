@@ -18,7 +18,7 @@ pub(super) const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 fn add(a: u64, b: u64) -> u64 {
     a.saturating_add(b).min(MAX_COUNTER)
 }
-fn scope(identity: &IdentityClient) -> String {
+pub(super) fn scope(identity: &IdentityClient) -> String {
     let view = identity.view();
     let mut hash = Sha256::new();
     for value in [

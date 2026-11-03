@@ -269,33 +269,40 @@ impl Source {
             if cancel.is_cancelled() {
                 return;
             }
-            let scope = source.scope.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                let root = crate::private_data_directory().map_err(|_| ())?;
-                if std::fs::symlink_metadata(&root).is_ok_and(|m| !m.file_type().is_dir()) {
-                    return Err(());
-                }
-                disk::Queue::open(root.join("telemetry"), scope)
-            })
-            .await
-            .map_err(|_| ())
-            .and_then(|r| r);
-            let q = match opened {
-                Ok(q) => {
-                    let mut state = source.native.lock().unwrap_or_else(|e| e.into_inner());
-                    state.queue = Some(q.clone());
-                    state.initialised = true;
-                    state.staging = true;
-                    q
-                }
-                Err(()) => {
-                    source
-                        .native
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .initialised = true;
-                    let _ = source.remember_native(Err(()), None);
+            let q = loop {
+                if cancel.is_cancelled() {
                     return;
+                }
+                let scope = source.scope.clone();
+                let opened = tokio::task::spawn_blocking(move || {
+                    let root = crate::private_data_directory().map_err(|_| ())?;
+                    if std::fs::symlink_metadata(&root).is_ok_and(|m| !m.file_type().is_dir()) {
+                        return Err(());
+                    }
+                    disk::Queue::open(root.join("telemetry"), scope)
+                })
+                .await
+                .map_err(|_| ())
+                .and_then(|r| r);
+                match opened {
+                    Ok(q) => {
+                        let mut state = source.native.lock().unwrap_or_else(|e| e.into_inner());
+                        state.queue = Some(q.clone());
+                        state.initialised = true;
+                        state.staging = true;
+                        break q;
+                    }
+                    Err(()) => {
+                        source
+                            .native
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .initialised = true;
+                        let _ = source.remember_native(Err(()), None);
+                        // RAM delivery remains usable while another original
+                        // sender or a temporarily unavailable store owns disk.
+                        tokio::select! { _=cancel.cancelled()=>return, _=runtime::sleep(Duration::from_secs(5))=>{} }
+                    }
                 }
             };
             loop {
