@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+mod native_spool;
 use super::*;
 use nddev_device_sync_telemetry::{
     Config,
@@ -350,6 +352,8 @@ async fn actual_signed_client_delivery_and_incidents() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }).await.expect("actual native spans did not become searchable");
+    #[cfg(not(target_arch = "wasm32"))]
+    let restart_result = native_spool::qualify(&identity, &fixture, &receipt, &http, &query).await;
     identity.logout().await.unwrap();
     identity
         .store
@@ -357,7 +361,7 @@ async fn actual_signed_client_delivery_and_incidents() {
         .delete()
         .await
         .unwrap();
-    std::fs::write(receipt.with_file_name("client-delivery-result.json"), json!({"trace_id":trace_id,"delivered_events":after.delivered,"delivered_spans":after.spans_delivered,"dropped":after.dropped+after.spans_dropped,"signed_gateway":"passed","incident_ack_replay_resolution":"passed","background_resume":"passed","actual_server_disconnect_reconnect":"passed","observed_delivery_failures":after.failures-before.failures,"feedback":"absent","searchable_logs":searchable_logs,"searchable_native_spans":native_count}).to_string()).unwrap();
+    std::fs::write(receipt.with_file_name("client-delivery-result.json"), json!({"trace_id":trace_id,"delivered_events":after.delivered,"delivered_spans":after.spans_delivered,"dropped":after.dropped+after.spans_dropped,"signed_gateway":"passed","incident_ack_replay_resolution":"passed","background_resume":"passed","actual_server_disconnect_reconnect":"passed","observed_delivery_failures":after.failures-before.failures,"feedback":"absent","searchable_logs":searchable_logs,"searchable_native_spans":native_count,"client_process_restart":restart_result}).to_string()).unwrap();
     traces.shutdown();
     logger.shutdown();
 }

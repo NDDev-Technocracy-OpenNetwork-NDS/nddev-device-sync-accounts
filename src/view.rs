@@ -170,7 +170,7 @@ pub enum DeliveryCollection {
 )]
 pub struct DeliveryView {
     pub initialized: bool,
-    /// Browser durable-spool availability; native transport does not use it.
+    /// Last demonstrated payload-write readiness of the platform durable spool.
     pub local_persistence_ready: Option<bool>,
     pub policy: ExportPolicy,
     pub collection: DeliveryCollection,
