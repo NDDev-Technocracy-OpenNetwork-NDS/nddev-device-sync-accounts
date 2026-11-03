@@ -216,6 +216,9 @@ impl Source {
     pub(super) fn start_native_staging(self: &Arc<Self>, cancel: CancellationToken) {
         let source = self.clone();
         runtime::spawn(async move {
+            if cancel.is_cancelled() {
+                return;
+            }
             let scope = source.scope.clone();
             let opened = tokio::task::spawn_blocking(move || {
                 let root = crate::private_data_directory().map_err(|_| ())?;

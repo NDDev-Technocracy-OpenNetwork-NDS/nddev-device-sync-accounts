@@ -40,7 +40,7 @@ fn feed(count: usize) -> ExportFeed {
     let feed = control.subscribe().unwrap();
     tracing::subscriber::with_default(subscriber, || {
         for _ in 0..count {
-            tracing::info!(target:"nds_spool_test",event.name="spool.fixture.record",outcome="ok");
+            tracing::event!(target:"nds_spool_test",tracing::Level::INFO,{event.name="spool.fixture.record",outcome="ok"});
         }
     });
     feed
@@ -270,6 +270,84 @@ async fn unknown_format_and_future_clock_leave_existing_bytes_untouched() {
     db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
     assert!(Queue::open(root.0.clone(), "a".repeat(64)).is_err());
+}
+#[tokio::test]
+async fn expired_other_scope_waits_for_its_actual_sender_and_keeps_its_loss_count() {
+    let root = Root::new();
+    let a = root.queue('a');
+    let b = root.queue('b');
+    put(&a, false, 1).await;
+    let original = a.next().await.unwrap().unwrap();
+    b.run(|db, _, _| {
+        db.execute(
+            "UPDATE batches SET expires=0 WHERE scope=?1",
+            ["a".repeat(64)],
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    b.health().await.unwrap();
+    assert_eq!(a.health().await.unwrap().events.pending, 1);
+    drop(original);
+    drop(a);
+    let health = b.health().await.unwrap();
+    assert_eq!((health.events.pending, health.events.dropped), (0, 0));
+    let a = root.queue('a');
+    let health = a.health().await.unwrap();
+    assert_eq!((health.events.pending, health.events.dropped), (0, 1));
+}
+#[tokio::test]
+async fn cancelled_waiter_keeps_the_os_lease_until_real_sqlite_io_finishes() {
+    let root = Root::new();
+    let q = root.queue('a');
+    let ingress = feed(1);
+    let blocker = Connection::open(root.0.join("exports.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let original = q.clone();
+    let batch = ingress.take_batch().unwrap();
+    let work = tokio::spawn(async move { original.persist(false, batch).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while q.io.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    work.abort();
+    assert!(work.await.is_err_and(|e| e.is_cancelled()));
+    drop(q);
+    let lease = private_file(
+        &root
+            .0
+            .join("senders")
+            .join(format!("{}.lock", "a".repeat(64))),
+        false,
+    )
+    .unwrap();
+    assert!(lease.try_lock().is_err());
+    blocker.execute_batch("COMMIT").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if lease.try_lock().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(lease);
+    let q = root.queue('a');
+    assert_eq!(q.health().await.unwrap().events.pending, 1);
+    assert_eq!(
+        (
+            ingress.health().pending,
+            ingress.health().dropped,
+            ingress.health().delivered
+        ),
+        (0, 0, 0)
+    );
 }
 #[cfg(unix)]
 #[test]

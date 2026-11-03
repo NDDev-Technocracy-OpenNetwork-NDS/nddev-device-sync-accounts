@@ -41,6 +41,7 @@ pub(super) struct Queue {
     started: Instant,
     start_ms: u64,
     _sender: File,
+    senders: PathBuf,
 }
 fn now_ms() -> Result<u64, ()> {
     u64::try_from(
@@ -67,12 +68,16 @@ fn directory(path: &Path) -> Result<(), ()> {
     }
     Ok(())
 }
-fn private_file(path: &Path) -> Result<File, ()> {
+fn private_file(path: &Path, create: bool) -> Result<File, ()> {
     if fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(());
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -105,7 +110,7 @@ impl Queue {
         directory(&root)?;
         let root = fs::canonicalize(root).map_err(|_| ())?;
         let path = root.join("exports.sqlite3");
-        let _file = private_file(&path)?;
+        let _file = private_file(&path, true)?;
         let mut db = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -191,13 +196,15 @@ impl Queue {
         // would allow two processes to own different files for the same scope.
         let senders = root.join("senders");
         directory(&senders)?;
-        let sender = private_file(&senders.join(format!("{scope}.lock")))?;
+        let sender = private_file(&senders.join(format!("{scope}.lock")), previous.is_none())?;
         sender.try_lock().map_err(|_| ())?;
         // The OS lease proves the previous owner and its storage operations
         // have ended. Retained attempts/bytes/expiry keep their original values.
         tx.execute("UPDATE batches SET claimed=0 WHERE scope=?1", [&scope])
             .map_err(|_| ())?;
+        let leases = expire_other_scopes(&tx, &senders, &scope, now)?;
         tx.commit().map_err(|_| ())?;
+        drop(leases);
         Ok(Arc::new(Self {
             db: Mutex::new(db),
             io: Arc::new(Semaphore::new(1)),
@@ -205,6 +212,7 @@ impl Queue {
             started: Instant::now(),
             start_ms: now,
             _sender: sender,
+            senders,
         }))
     }
     fn clock(&self) -> Result<u64, ()> {
@@ -239,14 +247,17 @@ impl Queue {
         self.clock().map_or(true, |now| now >= batch.expires_at_ms)
     }
     pub async fn health(self: &Arc<Self>) -> Result<Health, ()> {
-        self.run(|db, scope, now| {
+        let senders = self.senders.clone();
+        self.run(move |db, scope, now| {
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| ())?;
-            expire(&tx, scope, now)?;
+            let leases = expire_other_scopes(&tx, &senders, scope, now)?;
+            expire(&tx, scope, now, false)?;
             touch(&tx, scope, now)?;
             let health = snapshot(&tx, scope)?;
             tx.commit().map_err(|_| ())?;
+            drop(leases);
             Ok(health)
         })
         .await?
@@ -256,11 +267,13 @@ impl Queue {
         trace: bool,
         batch: ExportBatch,
     ) -> Result<(Health, bool), Option<ExportBatch>> {
+        let senders = self.senders.clone();
         self.run(move |db,scope,now| {
             let commit = (|| {
                 let expiry = batch.expires_at_ms().map_err(|_| ())?;
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ())?;
-                expire(&tx,scope,now)?;
+                let leases = expire_other_scopes(&tx, &senders, scope, now)?;
+                expire(&tx,scope,now,false)?;
                 let enabled: bool = tx.query_row("SELECT enabled FROM scopes WHERE scope=?1",[scope],|r|r.get(0)).map_err(|_| ())?;
                 let (bytes,records):(u64,u32) = tx.query_row("SELECT coalesce(sum(length(payload)),0),coalesce(sum(count),0) FROM batches",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_| ())?;
                 let stored = enabled && expiry>now && bytes+batch.bytes().len() as u64<=MAX_BYTES && records+batch.count()<=MAX_RECORDS;
@@ -271,6 +284,7 @@ impl Queue {
                 }
                 touch(&tx,scope,now)?;
                 tx.commit().map_err(|_| ())?;
+                drop(leases);
                 Ok(stored)
             })();
             match commit {
@@ -287,7 +301,7 @@ impl Queue {
     pub async fn next(self: &Arc<Self>) -> Result<Option<Batch>, ()> {
         self.run(|db,scope,now| {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ())?;
-            expire(&tx,scope,now)?;
+            expire(&tx,scope,now,false)?;
             let batch = tx.query_row("SELECT id,trace,count,payload,expires,attempts FROM batches WHERE scope=?1 AND claimed=0 ORDER BY id LIMIT 1",[scope],|r|Ok(Batch{id:r.get(0)?,trace:r.get(1)?,count:r.get(2)?,bytes:r.get(3)?,expires_at_ms:r.get(4)?,attempts:r.get(5)?})).optional().map_err(|_| ())?;
             if let Some(batch) = &batch {
                 if !(1..=32).contains(&batch.count) || batch.bytes.is_empty() || batch.bytes.len()>65536 || batch.attempts>8 {return Err(());}
@@ -406,17 +420,65 @@ fn touch(db: &Connection, scope: &str, now: u64) -> Result<(), ()> {
     let changed=db.execute("UPDATE scopes SET observed_at=max(observed_at,?1),revision=revision+1 WHERE scope=?2 AND revision<9007199254740991",params![now,scope]).map_err(|_| ())?;
     if changed == 1 { Ok(()) } else { Err(()) }
 }
-fn expire(db: &Transaction<'_>, scope: &str, now: u64) -> Result<(), ()> {
+fn expire(db: &Transaction<'_>, scope: &str, now: u64, include_claimed: bool) -> Result<bool, ()> {
     for trace in [false, true] {
-        let count:u64=db.query_row("SELECT coalesce(sum(count),0) FROM batches WHERE scope=?1 AND trace=?2 AND claimed=0 AND expires<=?3",params![scope,trace,now],|r|r.get(0)).map_err(|_| ())?;
+        let count:u64=db.query_row("SELECT coalesce(sum(count),0) FROM batches WHERE scope=?1 AND trace=?2 AND (claimed=0 OR ?4) AND expires<=?3",params![scope,trace,now,include_claimed],|r|r.get(0)).map_err(|_| ())?;
         counter(db, scope, trace, "dropped", count)?;
     }
-    db.execute(
-        "DELETE FROM batches WHERE scope=?1 AND claimed=0 AND expires<=?2",
-        params![scope, now],
-    )
-    .map_err(|_| ())?;
-    Ok(())
+    let removed = db
+        .execute(
+            "DELETE FROM batches WHERE scope=?1 AND (claimed=0 OR ?3) AND expires<=?2",
+            params![scope, now, include_claimed],
+        )
+        .map_err(|_| ())?;
+    Ok(removed != 0)
+}
+// Reclaim expired payloads from an inactive original scope only after its
+// stable OS lock proves that no old process or detached storage I/O owns it.
+// Keep scope counters and lock inodes; the same finite 16-scope bound applies.
+fn expire_other_scopes(
+    db: &Transaction<'_>,
+    senders: &Path,
+    current: &str,
+    now: u64,
+) -> Result<Vec<File>, ()> {
+    let mut statement = db
+        .prepare("SELECT scope,observed_at FROM scopes WHERE scope<>?1 LIMIT 17")
+        .map_err(|_| ())?;
+    let scopes = statement
+        .query_map([current], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+        })
+        .map_err(|_| ())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ())?;
+    if scopes.len() >= MAX_SCOPES as usize {
+        return Err(());
+    }
+    let mut leases = Vec::new();
+    for (scope, observed) in scopes {
+        if scope.len() != 64
+            || !scope
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(());
+        }
+        if observed > now {
+            continue;
+        }
+        let Ok(file) = private_file(&senders.join(format!("{scope}.lock")), false) else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            continue;
+        }
+        if expire(db, &scope, now, true)? {
+            touch(db, &scope, now)?;
+        }
+        leases.push(file);
+    }
+    Ok(leases)
 }
 fn snapshot(db: &Connection, scope: &str) -> Result<Health, ()> {
     let mut h=db.query_row("SELECT delivered_events,delivered_traces,dropped_events,dropped_traces,failures_events,failures_traces,last_success,revision FROM scopes WHERE scope=?1",[scope],|r|Ok(Health{events:FeedHealth{delivered:r.get(0)?,dropped:r.get(2)?,failures:r.get(4)?,..Default::default()},traces:FeedHealth{delivered:r.get(1)?,dropped:r.get(3)?,failures:r.get(5)?,..Default::default()},last_success_at:r.get(6)?,revision:r.get(7)?})).map_err(|_| ())?;

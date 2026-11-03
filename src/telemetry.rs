@@ -108,7 +108,9 @@ impl Delivery {
         }));
         let (active, receiver) = watch::channel(foreground);
         let cancel = CancellationToken::new();
-        source.start_staging(cancel.clone());
+        if source.matches(&identity) {
+            source.start_staging(cancel.clone());
+        }
         let task = runtime::spawn(run(
             identity,
             source.clone(),
