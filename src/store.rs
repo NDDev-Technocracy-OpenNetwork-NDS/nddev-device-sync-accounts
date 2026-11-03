@@ -33,29 +33,24 @@ const IO_TIMEOUT: Duration = Duration::from_secs(15);
 fn diagnostic_read(event: &str) -> bool {
     matches!(
         event,
-        "identity.credential.read" | "identity.offline.fence.read"
+        "identity.credential.read" | "identity.offline.fence.read" | "identity.operation.admitted"
     )
 }
 
 fn io_span(event: &str) -> Result<tracing::Span, ClientError> {
-    use opentelemetry::trace::TraceContextExt;
-    let parent = tracing::Span::current();
-    // A useful operation must fit the bounded feed without exporting a span
-    // for every repeated key/fence lookup. Keep its actual parent correlation;
-    // standalone reads still create a trace. Delivery suppression is inherited.
-    if diagnostic_read(event)
-        && nddev_device_sync_telemetry::trace_context(&parent)
-            .span()
-            .span_context()
-            .is_valid()
-    {
-        return Ok(parent);
+    // Reads and temporary admission leases belong to their actual caller.
+    // A standalone maintenance lookup is not another functional operation;
+    // creating a new exportable root for it can amplify diagnostic delivery.
+    // Existing parents keep real correlation and delivery suppression, even
+    // through a dependency span without its own OpenTelemetry context.
+    if diagnostic_read(event) {
+        return Ok(tracing::Span::current());
     }
     nddev_device_sync_telemetry::operation_span("accounts", "io")
         .map_err(|_| ClientError::TelemetryUnavailable)
 }
 
-// Repeated reads are diagnostics; mutations and all failures remain normal-mode
+// Reads and successful temporary admission are diagnostics; mutations and all failures remain normal-mode
 // audit events. Native and browser adapters use the same completion policy.
 fn report_io<T>(event: &'static str, result: &Result<T, ClientError>, duration_ms: u64) {
     match result {

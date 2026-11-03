@@ -51,6 +51,7 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
                 for _ in 0..100 {
                     complete("identity.credential.read", Ok(()));
                     complete("identity.offline.fence.read", Ok(()));
+                    complete("identity.operation.admitted", Ok(()));
                 }
                 complete("identity.credential.write", Ok(()));
                 complete("identity.credential.delete", Ok(()));
@@ -72,17 +73,26 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
                 complete("identity.credential.read", Ok(()));
                 complete("identity.credential.read", Err(ClientError::Timeout));
             });
-        let standalone = io_span("identity.credential.read").unwrap();
-        assert!(
-            nddev_device_sync_telemetry::trace_context(&standalone)
-                .span()
-                .span_context()
-                .is_valid()
-        );
+        for _ in 0..100 {
+            for event in [
+                "identity.credential.read",
+                "identity.offline.fence.read",
+                "identity.operation.admitted",
+            ] {
+                let standalone = io_span(event).unwrap();
+                assert!(
+                    !nddev_device_sync_telemetry::trace_context(&standalone)
+                        .span()
+                        .span_context()
+                        .is_valid()
+                );
+                standalone.in_scope(|| report_io(event, &Ok::<(), ClientError>(()), 1));
+            }
+        }
     });
-    // The parent, three mutations and a standalone read retain real spans.
-    // Two hundred nested reads cannot exhaust the unchanged 128-span feed.
-    assert_eq!(feed.health().pending, 5);
+    // Only the actual parent and three mutations retain real spans. Repeated
+    // nested or standalone maintenance cannot fill the 128-span feed.
+    assert_eq!(feed.health().pending, 4);
     assert_eq!(feed.health().dropped, 0);
     assert!(!control.debug_active());
     assert_eq!(control.rejected_fields_or_events(), 0);
