@@ -1,6 +1,7 @@
 use nddev_device_sync_accounts::SessionStore;
 use nddev_device_sync_telemetry::{Config, DebugWindow};
 use opentelemetry::trace::TracerProvider;
+use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
 struct OwnedLog(std::path::PathBuf);
@@ -41,6 +42,13 @@ async fn owned_ephemeral_entry_round_trips_and_is_deleted() {
         .unwrap();
         let scope = format!("https://nds-test-{}.invalid/", uuid::Uuid::new_v4());
         let value = uuid::Uuid::new_v4().to_string();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        // Low-level reads belong to their real caller rather than creating a
+        // separate root span. Exercise the entire native round trip as that
+        // actual operation and require every I/O event to retain its context.
+        let caller = tracing::dispatcher::with_default(&dispatch, || {
+            nddev_device_sync_telemetry::operation_span("accounts", "io").unwrap()
+        });
         async {
             let store = SessionStore::for_endpoint(&scope).unwrap();
             assert!(store.read().await.unwrap().is_none());
@@ -52,7 +60,8 @@ async fn owned_ephemeral_entry_round_trips_and_is_deleted() {
             assert_eq!(read.unwrap().unwrap().as_slice(), value.as_bytes());
             assert!(store.read().await.unwrap().is_none());
         }
-        .with_subscriber(tracing::Dispatch::new(subscriber))
+        .instrument(caller)
+        .with_subscriber(dispatch)
         .await;
         assert_eq!(control.rejected_fields_or_events(), 0);
         drop(control);
@@ -87,6 +96,12 @@ async fn owned_ephemeral_entry_round_trips_and_is_deleted() {
                 vec!["identity.credential.write", "identity.credential.delete"]
             }
         );
+        let traces: std::collections::BTreeSet<_> = events
+            .iter()
+            .filter(|event| event.event_name.starts_with("identity."))
+            .map(|event| event.trace_id.as_ref().unwrap())
+            .collect();
+        assert_eq!(traces.len(), 1, "native I/O must retain its caller trace");
         for event in events
             .into_iter()
             .filter(|event| event.event_name.starts_with("identity."))
