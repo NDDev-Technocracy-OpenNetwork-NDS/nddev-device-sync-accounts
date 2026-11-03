@@ -316,8 +316,15 @@ async fn delivery_admission_io_remains_outside_the_trace_export_feed() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn completed_native_dispatch_and_leases_keep_file_descriptors_bounded() {
+    use std::os::unix::fs::DirBuilderExt;
     const CHILD: &str = "NDS_NATIVE_DISPATCH_FD_CHILD";
     if std::env::var(CHILD).as_deref() != Ok("1") {
+        let directory =
+            std::env::temp_dir().join(format!("nds-native-fd-unit-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "completed_native_dispatch_and_leases_keep_file_descriptors_bounded",
@@ -325,17 +332,20 @@ async fn completed_native_dispatch_and_leases_keep_file_descriptors_bounded() {
                 "--test-threads=1",
             ])
             .env(CHILD, "1")
+            .env("XDG_STATE_HOME", &directory)
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
+                std::fs::remove_dir_all(&directory).unwrap();
                 assert!(status.success(), "Native dispatch FD child failed");
                 return;
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
+                std::fs::remove_dir_all(&directory).unwrap();
                 panic!("Native dispatch FD child exceeded its deadline");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
