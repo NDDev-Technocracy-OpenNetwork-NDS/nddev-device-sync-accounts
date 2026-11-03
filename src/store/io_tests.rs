@@ -51,6 +51,7 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
                 for _ in 0..100 {
                     complete("identity.credential.read", Ok(()));
                     complete("identity.offline.fence.read", Ok(()));
+                    complete("identity.operation.admitted", Ok(()));
                 }
                 complete("identity.credential.write", Ok(()));
                 complete("identity.credential.delete", Ok(()));
@@ -72,17 +73,26 @@ fn read_diagnostics_do_not_hide_failures_or_mutation_audit() {
                 complete("identity.credential.read", Ok(()));
                 complete("identity.credential.read", Err(ClientError::Timeout));
             });
-        let standalone = io_span("identity.credential.read").unwrap();
-        assert!(
-            nddev_device_sync_telemetry::trace_context(&standalone)
-                .span()
-                .span_context()
-                .is_valid()
-        );
+        for _ in 0..100 {
+            for event in [
+                "identity.credential.read",
+                "identity.offline.fence.read",
+                "identity.operation.admitted",
+            ] {
+                let standalone = io_span(event).unwrap();
+                assert!(
+                    !nddev_device_sync_telemetry::trace_context(&standalone)
+                        .span()
+                        .span_context()
+                        .is_valid()
+                );
+                standalone.in_scope(|| report_io(event, &Ok::<(), ClientError>(()), 1));
+            }
+        }
     });
-    // The parent, three mutations and a standalone read retain real spans.
-    // Two hundred nested reads cannot exhaust the unchanged 128-span feed.
-    assert_eq!(feed.health().pending, 5);
+    // Only the actual parent and three mutations retain real spans. Repeated
+    // nested or standalone maintenance cannot fill the 128-span feed.
+    assert_eq!(feed.health().pending, 4);
     assert_eq!(feed.health().dropped, 0);
     assert!(!control.debug_active());
     assert_eq!(control.rejected_fields_or_events(), 0);
@@ -252,4 +262,51 @@ async fn io_waiting_budget_is_bounded_and_cancelled_requests_release_capacity() 
     assert!(!remaining.is_zero() && remaining <= IO_TIMEOUT);
     drop(permit);
     drop(store.admit_io(&span).await.unwrap());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn delivery_admission_io_remains_outside_the_trace_export_feed() {
+    use nddev_device_sync_telemetry::{Config, client_traces::ClientTraces};
+    use tracing::Instrument;
+    use tracing::instrument::WithSubscriber;
+    let config = Config {
+        service: "nds-delivery-io-regression".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        repository: "NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts".into(),
+        commit: "unknown".into(),
+        channel: "alpha".into(),
+        standards: "unreleased".into(),
+        environment: "test".into(),
+        target_prefixes: vec!["nds_accounts".into()],
+        default_module: "process".into(),
+        debug: None,
+    };
+    let traces = ClientTraces::new(&config).unwrap();
+    let feed = traces.subscribe().unwrap();
+    let (subscriber, control) =
+        nddev_device_sync_telemetry::subscriber(config, std::io::sink(), traces.tracer()).unwrap();
+    async {
+        let store = SessionStore::for_endpoint(&format!(
+            "https://nds-delivery-{}.invalid",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        for _ in 0..10 {
+            let span = nddev_device_sync_telemetry::delivery_span();
+            store
+                .run_io("identity.operation.admitted", |_, _| Ok(()))
+                .instrument(span)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            feed.health().pending,
+            0,
+            "delivery credential admission created recursive spans"
+        );
+        assert_eq!(control.rejected_fields_or_events(), 0);
+    }
+    .with_subscriber(subscriber)
+    .await;
 }
