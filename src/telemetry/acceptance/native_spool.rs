@@ -152,8 +152,35 @@ pub(super) async fn qualify(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }).await.expect("hard-killed native client records did not become searchable exactly once in this fixture");
+    let streams: Value = http
+        .get(format!("{origin}/api/default/streams?type=traces"))
+        .basic_auth(user, Some(password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let span_count=tokio::time::timeout(Duration::from_secs(25),async {
+        loop {
+            let mut count=0;
+            for stream in streams["list"].as_array().unwrap() {
+                let table=stream["name"].as_str().unwrap();
+                assert!(!table.is_empty()&&table.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'));
+                let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+                let body=json!({"query":{"sql":format!("SELECT * FROM \"{table}\" WHERE trace_id='{trace}'"),"start_time":now-3_600_000_000u64,"end_time":now+2_000_000,"from":0,"size":100}});
+                let result:Value=http.post(format!("{origin}/api/default/_search?type=traces")).basic_auth(user,Some(password)).json(&body).send().await.unwrap().json().await.unwrap();
+                for row in result["hits"].as_array().into_iter().flatten().filter(|r|r["service_name"]=="nddev-device-sync-client") {
+                    assert_eq!(row["service_user_id"],original.user_id);assert_eq!(row["service_tenant_id"],original.tenant_id);assert_eq!(row["service_device_id"],original.current_device_id);
+                    assert_eq!(row["operation_name"],"module.operation");count+=1;
+                }
+            }
+            if count>0 {break count;}
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.expect("hard-killed native client's retained OTLP span did not become searchable");
     identity.refresh().await.unwrap();
-    json!({"hard_kill":"passed","restored_original_scope":"passed","secret_canary_before_disk":"absent","searchable_unique_events":count,"stage_receipt":stage_path,"drain_receipt":drain_path})
+    json!({"hard_kill":"passed","restored_original_scope":"passed","secret_canary_before_disk":"absent","searchable_unique_events":count,"searchable_retained_spans":span_count,"stage_receipt":stage_path,"drain_receipt":drain_path})
 }
 fn emit(marker: &str) {
     println!("{marker}");
