@@ -139,6 +139,27 @@ The browser acceptance exercises two actual virtual authenticators, selective
 credential/session revocation, idempotent absence, and preservation of OTP login.
 Physical authenticator qualification is separate.
 
+Native telemetry stages redacted SDK events and OTLP bytes into the existing
+Accounts private-data root, independently of HTTP delivery. SQLite commits the
+exact bytes, count, signal and original expiry before the SDK releases its RAM
+ownership. The database bounds payloads to 8 MiB, 4096 records and 16 scopes;
+each batch retains the SDK's 32-record / 64 KiB limits and 30-minute eligibility.
+An OS lock admits one native sender per verified origin/tenant/user/device scope.
+Another process, or an unavailable store, keeps bounded RAM-only delivery and
+reports persistence unavailable. A successful metadata read cannot claim recovery
+from a failed payload write. Native blocking operations retain the scope lease
+until their real completion, including after async caller cancellation.
+
+A restarted sender reclaims only its original scope, preserving bytes, expiry
+and failed-attempt counts. Known receipts retry local settlement only; partial
+trace receipts are terminal and count rejected records as dropped. Unknown
+outcomes may repeat spans, so exactly-once delivery is not claimed. Opt-out
+removes scoped queued payloads, without deleting another scope's records.
+Storage-format, symlink and future-clock refusals preserve the existing store.
+Native spool tests include real SQLite quota exhaustion and an actual hard-kill
+subprocess followed by exact-byte restart/settlement; remote collector delivery
+retains its separate end-to-end acceptance.
+
 Browser telemetry uses the SDK's authenticated-scope IndexedDB spool. RAM ingress
 staging runs independently of the common native/browser HTTP sender; a stalled
 request cannot block new durable batches. Retry counters survive page restart,

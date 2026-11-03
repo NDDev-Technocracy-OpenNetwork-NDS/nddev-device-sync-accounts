@@ -1,8 +1,8 @@
 //! The sender has one delivery policy. Its actual queue adapters differ: native
-//! owns bounded RAM batches; browser owns durable SDK batches plus a RAM ingress.
+//! owns an Accounts durable spool; browser owns an SDK durable spool. Both keep bounded RAM ingress.
 use crate::{IdentityClient, view::DeliveryView};
 #[cfg(not(target_arch = "wasm32"))]
-use nddev_device_sync_telemetry::ExportBatch;
+mod native;
 use nddev_device_sync_telemetry::ExportFeed;
 #[cfg(target_arch = "wasm32")]
 use nddev_device_sync_telemetry::FeedHealth;
@@ -14,7 +14,7 @@ use {
     std::sync::Mutex,
 };
 
-const MAX_COUNTER: u64 = 9_007_199_254_740_991;
+pub(super) const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 fn add(a: u64, b: u64) -> u64 {
     a.saturating_add(b).min(MAX_COUNTER)
 }
@@ -45,6 +45,8 @@ pub(super) struct Source {
     pub events: Arc<ExportFeed>,
     pub traces: Arc<ExportFeed>,
     scope: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    native: std::sync::Mutex<native::State>,
     #[cfg(target_arch = "wasm32")]
     queue: browser_queue::Queue,
     #[cfg(target_arch = "wasm32")]
@@ -59,6 +61,8 @@ impl Source {
             #[cfg(target_arch = "wasm32")]
             queue: browser_queue::Queue::new(scope.clone()).expect("SHA-256 delivery scope"),
             scope,
+            #[cfg(not(target_arch = "wasm32"))]
+            native: std::sync::Mutex::default(),
             #[cfg(target_arch = "wasm32")]
             persistent: Mutex::default(),
         }
@@ -85,6 +89,8 @@ impl Source {
         view.spans_delivered = traces.delivered;
         view.spans_dropped = traces.dropped;
         view.spans_failures = traces.failures;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.snapshot_native(view);
         #[cfg(target_arch = "wasm32")]
         {
             let stored = self.persistent.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,6 +179,8 @@ impl Source {
     pub async fn maintain(&self) -> Result<(), ()> {
         self.events.health();
         self.traces.health();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.maintain_native().await;
         #[cfg(target_arch = "wasm32")]
         self.remember(self.queue.health().await, false)?;
         Ok(())
@@ -184,6 +192,8 @@ impl Source {
         }
         #[cfg(target_arch = "wasm32")]
         self.remember(self.queue.set_enabled(enabled).await, false)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.enabled_native(enabled).await?;
         if enabled {
             self.events.set_enabled(true);
             self.traces.set_enabled(true);
@@ -193,22 +203,7 @@ impl Source {
     pub async fn next(&self, prefer_trace: bool) -> Result<Option<Batch>, ()> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let selected = if prefer_trace {
-                self.traces
-                    .take_batch()
-                    .map(|b| (b, true))
-                    .or_else(|| self.events.take_batch().map(|b| (b, false)))
-            } else {
-                self.events
-                    .take_batch()
-                    .map(|b| (b, false))
-                    .or_else(|| self.traces.take_batch().map(|b| (b, true)))
-            };
-            Ok(selected.map(|(batch, trace)| Batch {
-                batch,
-                trace,
-                accepted: None,
-            }))
+            self.next_native(prefer_trace).await
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -234,6 +229,10 @@ impl Source {
                 accepted: None,
             }))
         }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_staging(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
+        self.start_native_staging(cancel);
     }
     #[cfg(target_arch = "wasm32")]
     pub fn start_staging(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
@@ -315,9 +314,7 @@ impl Source {
 pub(super) struct Batch {
     accepted: Option<i64>,
     #[cfg(not(target_arch = "wasm32"))]
-    batch: ExportBatch,
-    #[cfg(not(target_arch = "wasm32"))]
-    trace: bool,
+    batch: native::Payload,
     #[cfg(target_arch = "wasm32")]
     batch: browser_queue::Batch,
     #[cfg(target_arch = "wasm32")]
@@ -350,7 +347,7 @@ impl Batch {
     pub fn trace(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.trace
+            self.batch.trace()
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -360,7 +357,7 @@ impl Batch {
     pub fn attempts(&self) -> u32 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            0
+            self.batch.attempts()
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -385,8 +382,7 @@ impl Batch {
         let accepted = self.accepted.ok_or(())?;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = source;
-            self.batch.acknowledge_count(accepted).map_err(|_| ())
+            self.batch.acknowledge(source, accepted).await
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -399,9 +395,7 @@ impl Batch {
     pub async fn failed(&self, source: &Source) -> Result<(), ()> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = source;
-            self.batch.failed();
-            Ok(())
+            self.batch.failed(source).await
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -411,9 +405,7 @@ impl Batch {
     pub async fn discard(self, source: &Source) -> Result<(), ()> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = source;
-            drop(self);
-            Ok(())
+            self.batch.discard(source).await
         }
         #[cfg(target_arch = "wasm32")]
         {
