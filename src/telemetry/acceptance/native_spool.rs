@@ -183,12 +183,20 @@ fn child() {
     runtime.block_on(child_run());
 }
 async fn child_run() {
+    // A killed or suspended parent cannot leave an unbounded fixture child,
+    // including a native stdin read that the async runtime cannot cancel.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        std::process::exit(2);
+    });
     let mode = std::env::var("NDS_NATIVE_SPOOL_CHILD_MODE").unwrap();
     assert!(mode == "stage" || mode == "drain");
     let output = PathBuf::from(std::env::var_os("NDS_NATIVE_SPOOL_CHILD_OUTPUT").unwrap());
     assert!(output.is_absolute() && !output.exists());
     let receipt = PathBuf::from(std::env::var_os("NDS_FIXTURE_RECEIPT").unwrap());
     let fixture: Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(output.parent(), receipt.parent());
+    assert!(!output.starts_with(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))));
     let endpoint = fixture["base_url"].as_str().unwrap();
     assert!(endpoint.starts_with("http://127.0.0.1:"));
     assert_eq!(fixture["status"], "running");
