@@ -310,3 +310,78 @@ async fn delivery_admission_io_remains_outside_the_trace_export_feed() {
     .with_subscriber(subscriber)
     .await;
 }
+
+/// Exercise native dispatch and cross-process ownership without accessing a
+/// credential provider. A fresh bounded child isolates unrelated test FDs.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn completed_native_dispatch_and_leases_keep_file_descriptors_bounded() {
+    const CHILD: &str = "NDS_NATIVE_DISPATCH_FD_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "completed_native_dispatch_and_leases_keep_file_descriptors_bounded",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "Native dispatch FD child failed");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Native dispatch FD child exceeded its deadline");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // SAFETY: only this fresh test child lowers its own soft limit; the parent,
+    // other tests and inherited hard limit remain unchanged.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = limit.rlim_cur.min(256);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let store = SessionStore::for_endpoint(&format!(
+        "https://nds-native-fd-{}.invalid/",
+        uuid::Uuid::new_v4()
+    ))
+    .unwrap();
+    for _ in 0..32 {
+        let permit = store
+            .activate_operation(store.operation().unwrap())
+            .await
+            .unwrap();
+        store
+            .run_io("identity.credential.read", |_, _| Ok(()))
+            .await
+            .unwrap();
+        drop(permit);
+    }
+    let before = count();
+    for _ in 0..2048 {
+        let permit = store
+            .activate_operation(store.operation().unwrap())
+            .await
+            .unwrap();
+        store
+            .run_io("identity.credential.read", |_, _| Ok(()))
+            .await
+            .unwrap();
+        drop(permit);
+    }
+    let after = count();
+    eprintln!("Native dispatch/lease FDs before={before}, after={after}");
+    assert!(
+        after <= before + 4,
+        "Completed native I/O retained file descriptors"
+    );
+}

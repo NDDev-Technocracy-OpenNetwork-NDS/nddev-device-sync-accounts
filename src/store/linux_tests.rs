@@ -243,3 +243,62 @@ fn ambiguous_records_are_never_read_overwritten_or_deleted() {
     drop(owned);
     assert!(Entry::new(&service, key).unwrap().read().unwrap().is_none());
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated unlocked Secret Service and a fresh descriptor-measurement process"]
+async fn completed_native_store_reads_keep_file_descriptors_bounded() {
+    assert_eq!(std::env::var("NDS_ISOLATED_PROVIDER").as_deref(), Ok("1"));
+    let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let scope = format!("https://nds-native-fd-{}.invalid/", uuid::Uuid::new_v4());
+    let store = SessionStore::for_endpoint(&scope).unwrap();
+    let value = b"owned-descriptor-fixture";
+    store.write(value).await.unwrap();
+    let outcome = async {
+        for _ in 0..32 {
+            assert_eq!(
+                store
+                    .read()
+                    .await
+                    .map_err(|_| "native read failed".to_owned())?
+                    .unwrap()
+                    .as_slice(),
+                value
+            );
+        }
+        let before = count();
+        let mut peak = before;
+        for _ in 0..32 {
+            for _ in 0..64 {
+                assert_eq!(
+                    store
+                        .read()
+                        .await
+                        .map_err(|_| "native read failed".to_owned())?
+                        .unwrap()
+                        .as_slice(),
+                    value
+                );
+            }
+            let current = count();
+            peak = peak.max(current);
+            // Refuse growth while enough descriptors remain to delete this
+            // test's entry. Do not raise a process or host resource limit.
+            if current > before + 8 {
+                return Err(format!(
+                    "descriptor growth: before={before}, peak={peak}, current={current}"
+                ));
+            }
+        }
+        eprintln!(
+            "Native store FDs before={before}, peak={peak}, after={}",
+            count()
+        );
+        Ok(())
+    }
+    .await;
+    store.delete().await.unwrap();
+    assert!(
+        outcome.is_ok(),
+        "Native store retained completed-read descriptors: {outcome:?}"
+    );
+}
