@@ -28,7 +28,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1.53", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "98f8a98cd6d9c2e679a5cc566de9a4128dbb34f6", features = ["client-traces", "native-spool"] }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "55291f01682fdba5802653225708cac815f04edb", features = ["client-traces", "native-spool"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 url = "2.5"
@@ -64,14 +64,14 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
 ring = {version="0.17", features=["wasm32_unknown_unknown_js"]}
 time = {version="0.3", features=["wasm-bindgen"]}
-wasm-bindgen = "=0.2.129"
-wasm-bindgen-futures = "=0.4.79"
-js-sys = "=0.3.106"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
 uuid = { version = "1.27", features = ["js"] }
 web-time = "1.1"
 futures = "0.3"
 gloo-timers = { version = "0.4", features = ["futures"] }
-web-sys = { version = "=0.3.106", features = ["Window", "Location", "History"] }
+web-sys = { version = "=0.3.107", features = ["Window", "Location", "History"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
