@@ -3,15 +3,16 @@
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
-  "packageManager": "bun@1.4.3",
+  "packageManager": "bun@1.4.4",
   "scripts": {
-    "check": "tsc --noEmit && biome check src/*.ts && bun run test:browser-http",
+    "check": "tsc --noEmit && biome check src/*.ts",
     "test:browser-http": "bun test src/browser_http.test.ts",
     "generate": "tsc",
-    "check:generated": "tsc && git diff --exit-code -- src/browser_credentials.js src/browser_http.js"
+    "check:generated": "tsc && git diff --exit-code -- src/browser_credentials.js src/browser_http.js",
+    "test": "bun run test:browser-http"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15",
+    "@biomejs/biome": "2.6.4",
     "typescript": "7.0.2"
   }
 }
