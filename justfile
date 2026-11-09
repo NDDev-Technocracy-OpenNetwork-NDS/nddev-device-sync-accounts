@@ -1,20 +1,27 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# List the project commands.
+default:
+    @just --list
+
 setup:
+    cargo fetch --locked
     bun install --frozen-lockfile --ignore-scripts
 
 # Source-only checks. Dependencies must already be prepared by setup.
 check: browser-check
+    just --fmt --check
     cargo fmt --check
     cargo deny --locked check licenses sources
     cargo shear --locked --deny-warnings
 
 # Execution host or runner only.
-test:
+test: build audit wasm-check
     cargo nextest run --locked --all-features --jobs 4 --profile ci
     cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
     cargo test --locked --doc --jobs 4
-    bun run test
+    bun test --reporter=junit --reporter-outfile=.nddev-reports/bun-test.xml
+    bun run check:generated
 
 # Full acceptance needs owned native-store and backend fixtures.
 verify: check test wasm-check generated-check native-store identity-acceptance
@@ -29,7 +36,6 @@ generated-check:
 
 browser-check:
     bun run check
-    bun run check:generated
 
 wasm-check:
     cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
@@ -41,3 +47,14 @@ native-store:
 # NDS_FIXTURE_RECEIPT must name an owned, running local server fixture.
 identity-acceptance:
     cargo test --locked --features development-http --test identity_backend -- --ignored
+
+# Compile the locked release workspace.
+build:
+    cargo build --locked --workspace --release --all-features --jobs 4
+
+# Check current RustSec advisories.
+audit:
+    cargo audit --deny warnings
+
+# Run the portable CI contract; native fixtures have explicit acceptance recipes.
+ci-verify: check test build audit wasm-check
