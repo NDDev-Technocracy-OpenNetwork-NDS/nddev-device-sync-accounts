@@ -1,6 +1,8 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 setup:
+    # GitHub's runners lack the credential-store build inputs this workspace links.
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev; fi
     bun install --frozen-lockfile --ignore-scripts
 
 # Source-only checks. Dependencies must already be prepared by setup.
