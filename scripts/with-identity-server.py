@@ -45,7 +45,10 @@ def main():
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             tar.extractall(source, filter="data")
         target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
-        env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+        # Compile historical fixture source with this project's selected SDK;
+        # its own old rust-toolchain file must not install another compiler.
+        toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        env = dict(os.environ, CARGO_TARGET_DIR=str(target), RUSTUP_TOOLCHAIN=toolchain)
         def terminate(number, _frame):
             raise SystemExit(128 + number)
         previous = signal.signal(signal.SIGTERM, terminate)

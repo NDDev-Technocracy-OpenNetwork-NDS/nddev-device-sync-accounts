@@ -1368,6 +1368,7 @@ dependencies = [
  "glib",
  "gloo-timers",
  "http",
+ "jni 0.21.1",
  "jni 0.22.4",
  "js-sys",
  "keyring-core",
