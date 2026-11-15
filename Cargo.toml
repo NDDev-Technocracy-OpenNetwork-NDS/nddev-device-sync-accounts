@@ -52,7 +52,7 @@ windows-native-keyring-store = "1.0"
 [target.'cfg(target_os = "android")'.dependencies]
 android-native-keyring-store = "1.0.0"
 jni = "0.22.4"
-jni-legacy = { package = "jni", version = "0.21.1" }
+jni-legacy = { package = "jni", version = "0.22.0" }
 rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
