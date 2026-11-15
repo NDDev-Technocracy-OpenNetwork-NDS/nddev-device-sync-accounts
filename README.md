@@ -21,7 +21,7 @@ acceptance and advisory audit. It requires the corresponding native session and 
 `just native-store` additionally exercises a fresh entry in the actual native
 credential service. It requires an unlocked session and never clears a keychain.
 `just generate` and `just generated-check` use the immutable `protocol.lock`
-source from `NDS_PROTOCOL_SOURCE` (defaults to the adjacent protocol checkout).
+source from `NDS_PROTOCOL_SOURCE`. Otherwise they use an adjacent protocol checkout\nwhen present, or fetch the exact public source commit for a standalone build.\nThe generator runs through the already selected Bun runtime.
 
 HTTPS is required. The opt-in `development-http` feature permits loopback HTTP
 in debug builds for isolated local acceptance only; ship without that feature.

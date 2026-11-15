@@ -13,6 +13,7 @@ check: browser-check
 
 # Execution host or runner only.
 test:
+    python3 -B -m unittest discover -s scripts -p 'test_*.py'
     cargo nextest run --locked --all-features --jobs 4 --profile ci
     cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
     cargo test --locked --doc --jobs 4
