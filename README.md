@@ -250,3 +250,7 @@ Development/manual runs also preserve format, all-feature Clippy and tests on
 Ubuntu 26.04, macOS 15 and Windows 2025 through the shared CI library. The full
 Linux release retains the Ubuntu 24.04 ABI baseline. Windows 2025 replaces the
 old provider label and must pass its real native run.
+
+After the complete same-repository development workflow succeeds, promotion
+advances main with the repository's isolated promotion key. The project's
+existing release and deployment commands keep their own lifecycle.
