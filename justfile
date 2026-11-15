@@ -2,7 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 setup:
     # GitHub's runners lack the credential-store build inputs this workspace links.
-    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev; fi
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-Linux}" = Linux ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev gnome-keyring dbus-daemon libglib2.0-bin; fi
     bun install --frozen-lockfile --ignore-scripts
 
 # Source-only checks. Dependencies must already be prepared by setup.
@@ -20,7 +20,7 @@ test:
     bun run test
 
 # Full acceptance needs owned native-store and backend fixtures.
-verify: check test wasm-check generated-check native-store identity-acceptance
+verify: check test wasm-check generated-check ci-native-store ci-identity-acceptance
     cargo build --locked --release --jobs 4
     cargo audit --deny warnings
 
@@ -41,6 +41,23 @@ native-store:
     cargo test --locked --test native_store -- --ignored
     cargo test --locked --lib cancellation_after_native_persistence -- --ignored
 
+# Full CI owns a private session; the explicit native-store recipe remains available.
+ci-native-store:
+    python3 scripts/with-secret-service.py just native-store
+
 # NDS_FIXTURE_RECEIPT must name an owned, running local server fixture.
 identity-acceptance:
     cargo test --locked --features development-http --test identity_backend -- --ignored
+
+# The pinned public server owns disposable PostgreSQL and a loopback-only mailbox.
+ci-identity-acceptance:
+    python3 scripts/with-identity-server.py just identity-acceptance
+
+native-setup:
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-Linux}" = Linux ]; then sudo apt-get update -qq && sudo apt-get install -qq --no-install-recommends -y libsecret-1-dev; fi
+    cargo fetch --locked
+
+native-check:
+    cargo fmt --check
+    cargo clippy --locked --all-targets --all-features --jobs 4 -- -D warnings
+    cargo test --locked --all-features --jobs 4

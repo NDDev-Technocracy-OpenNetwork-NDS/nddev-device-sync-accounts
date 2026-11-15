@@ -232,3 +232,21 @@ the route returns `device_policy_unavailable`. Accounts never chooses a mode:
 callers decide how an unreachable policy affects admission.
 
 Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts/releases).
+
+## CI fixtures and native platforms
+
+Full Linux verification creates a private Secret Service session for the two
+native-store tests and runs identity acceptance against the exact public server
+in acceptance-server.lock. The server's existing harness owns temporary
+PostgreSQL, a loopback-only SMTP mailbox, synthetic identities and its bounded
+lifetime. The client verifies login, native persistence, reopening, logout and
+server-side revocation. No login keyring, production database or external email
+is used. Shutdown uses the producer's stop marker, including failed commands
+and cancellation; receipts and credentials stay in private temporary storage.
+The explicit native-store and identity-acceptance recipes remain available for
+operator-owned fixtures.
+
+Development/manual runs also preserve format, all-feature Clippy and tests on
+Ubuntu 26.04, macOS 15 and Windows 2025 through the shared CI library. The full
+Linux release retains the Ubuntu 24.04 ABI baseline. Windows 2025 replaces the
+old provider label and must pass its real native run.

@@ -4,41 +4,25 @@ import argparse
 import io
 import os
 from pathlib import Path
-import re
 import subprocess
 import tarfile
 import tempfile
 import tomllib
+from pinned_source import source_archive
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def protocol_archive(lock):
     """Use the selected checkout, or fetch the exact public dependency for a standalone build."""
-    commit = lock["source_commit"]
-    repository = lock["source_repo"]
-    if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise ValueError("protocol source needs an exact commit")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-        raise ValueError("protocol source needs an exact GitHub repository")
     explicit = os.environ.get("NDS_PROTOCOL_SOURCE")
     source = Path(explicit) if explicit else ROOT.parent / "nddev-device-sync-protocol"
     if explicit and not source.is_dir():
         raise FileNotFoundError("selected protocol checkout is not a directory")
-    if explicit or source.is_dir():
-        return subprocess.check_output(
-            ["git", "-C", str(source), "archive", commit], timeout=30
-        )
-    with tempfile.TemporaryDirectory(prefix="nds-protocol-") as directory:
-        subprocess.run(["git", "init", "--quiet", "--bare", directory], check=True, timeout=30)
-        subprocess.run(
-            ["git", "-C", directory, "fetch", "--quiet", "--no-tags", "--depth=1",
-             f"https://github.com/{repository}.git", commit],
-            check=True, timeout=120,
-        )
-        return subprocess.check_output(
-            ["git", "-C", directory, "archive", commit], timeout=30
-        )
+    return source_archive(
+        lock["source_repo"], lock["source_commit"],
+        source if explicit or source.is_dir() else None,
+    )
 
 
 def main():
