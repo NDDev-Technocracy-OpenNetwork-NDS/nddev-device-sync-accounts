@@ -278,8 +278,11 @@ async fn unknown_format_and_future_clock_leave_existing_bytes_untouched() {
 #[tokio::test]
 async fn expired_other_scope_waits_for_its_actual_sender_and_keeps_its_loss_count() {
     let root = Root::new();
-    let a = root.queue('a');
-    let b = root.queue('b');
+    let open = |scope: char, stage: &str| {
+        Queue::open(root.0.clone(), scope.to_string().repeat(64)).expect(stage)
+    };
+    let a = open('a', "open the original sender");
+    let b = open('b', "open the other scope");
     put(&a, false, 1).await;
     let original = a.next().await.unwrap().unwrap();
     b.run(|db, _, _| {
@@ -297,7 +300,10 @@ async fn expired_other_scope_waits_for_its_actual_sender_and_keeps_its_loss_coun
     drop(a);
     let health = b.health().await.unwrap();
     assert_eq!((health.events.pending, health.events.dropped), (0, 0));
-    let a = root.queue('a');
+    let a = open(
+        'a',
+        "reopen the original sender after the other scope expires its batch",
+    );
     let health = a.health().await.unwrap();
     assert_eq!((health.events.pending, health.events.dropped), (0, 1));
 }
