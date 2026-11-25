@@ -75,10 +75,12 @@ web-sys = { version = "=0.3.107", features = ["Window", "Location", "History"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
-keyring-core = "1.0.0"
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "=0.43.0", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))'.dependencies]
+keyring-core = "1.0.0"
